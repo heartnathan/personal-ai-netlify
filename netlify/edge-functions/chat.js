@@ -14,6 +14,7 @@ import { resolveChatProvider } from '../../src/repo/providers.js'
 import { chatContextLoader } from '../../src/repo/context.js'
 import { resolveWebSearch } from '../../src/web_search_config.js'
 import { resolveMcpTools } from '../../src/mcp.js'
+import { resolveAllTools } from '../../src/doc_tools.js'
 
 export default async (request, context) => {
   const env = Netlify.env.toObject()
@@ -28,7 +29,7 @@ export default async (request, context) => {
         resolveProvider: (body, e) => resolveChatProvider(db, body, e),
         loadContext: db ? chatContextLoader(db) : undefined,
         resolveSearch: db ? (e) => resolveWebSearch(db, e) : undefined,
-        resolveTools: db ? () => resolveMcpTools(db) : undefined,
+        resolveTools: db ? () => resolveAllTools(db, resolveMcpTools) : undefined,
         // 回答在伺服器收齊後寫入（context.waitUntil：回應送出後繼續；仍計入 50 ms CPU）
         saveReply: db ? replySaver((input) => saveServerMessages(db, input)) : undefined,
         waitUntil: context && context.waitUntil ? (p) => context.waitUntil(p) : undefined,

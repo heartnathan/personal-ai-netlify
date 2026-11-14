@@ -26,6 +26,7 @@ import { handleChat, replySaver } from './chat.js'
 import { saveServerMessages } from './repo/conversations.js'
 import { chatContextLoader } from './repo/context.js'
 import { resolveMcpTools } from './mcp.js'
+import { resolveAllTools } from './doc_tools.js'
 import { resolveWebSearch } from './web_search_config.js'
 import { handleImageRequest } from './images.js'
 import { TOOLS, runTool } from './tools/registry.js'
@@ -102,7 +103,7 @@ async function apiRoute(request, env, path, method) {
       resolveProvider: (body, e) => resolveChatProvider(getDb(e), body, e),
       loadContext: getDb(env) ? chatContextLoader(getDb(env)) : undefined,
       resolveSearch: getDb(env) ? (e) => resolveWebSearch(getDb(e), e) : undefined,
-      resolveTools: getDb(env) ? () => resolveMcpTools(getDb(env)) : undefined,
+      resolveTools: getDb(env) ? () => resolveAllTools(getDb(env), resolveMcpTools) : undefined,
       saveReply: getDb(env) ? replySaver((input) => saveServerMessages(getDb(env), input)) : undefined,
     })
   }

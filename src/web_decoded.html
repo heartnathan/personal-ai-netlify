@@ -1646,6 +1646,14 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
             </div>
             <p id="mcp-status" class="settings-hint" style="min-height:18px"></p>
           </div>
+          <div class="settings-card" id="doc-tools-card" style="margin-top:14px">
+            <div class="form-label" style="margin-bottom:6px">文件工具</div>
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+              <input type="checkbox" id="doc-tools-toggle"> 讓模型使用文件工具（讀取免確認，寫入需確認）
+            </label>
+            <p class="settings-hint" style="margin:4px 0 0">開啟後，模型可自行列出、搜尋、讀取知識庫文件；新增或修改文件前會先顯示確認卡，你按「允許」才會儲存。</p>
+            <p id="doc-tools-status" class="settings-hint" style="min-height:18px"></p>
+          </div>
         </div>
 
         <div id="pane-plan" class="settings-pane">
@@ -3941,11 +3949,76 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
     });
   }
   function toolLabel(name) {
+    if (/^docs__/.test(String(name || ''))) return { server: '文件', tool: String(name).slice(6) };
     var m = String(name || '').match(/^(mcp[0-9a-f]+)__(.*)$/);
     if (!m) return { server: '', tool: name };
     var sv = null;
     for (var i = 0; i < mcpServersCache.length; i++) if (mcpServersCache[i].id === m[1]) sv = mcpServersCache[i];
     return { server: sv ? sv.name : 'MCP', tool: m[2] };
+  }
+  // 文件工具：docs__list / docs__search / docs__read 免確認；docs__save 一律顯示確認卡
+  var DOC_READ_TOOLS = { docs__list: 1, docs__search: 1, docs__read: 1 };
+  function isAutoTool(name) { return !!DOC_READ_TOOLS[name]; }
+  function docSaveConfirmHtml(call) {
+    var a = {};
+    try { a = JSON.parse(call.arguments || '{}') || {}; } catch(e) { a = {}; }
+    var existing = null;
+    if (a.id) for (var i = 0; i < documents.length; i++) if (documents[i] && documents[i].id === String(a.id)) existing = documents[i];
+    var isNew = !a.id;
+    var action = isNew ? '新增文件' : (a.mode === 'append' ? '修改文件（附加到文末）' : '修改文件（取代全文）');
+    var title = a.title ? String(a.title) : (existing ? existing.title : '');
+    var proj = '';
+    if (a.project_id != null && String(a.project_id).trim()) {
+      var pv = String(a.project_id).trim(), pr = projectById(pv);
+      if (!pr) for (var k = 0; k < projects.length; k++) if (projects[k] && String(projects[k].name || '').toLowerCase() === pv.toLowerCase()) pr = projects[k];
+      proj = pr ? pr.name : pv + '（找不到時會失敗）';
+    } else if (!isNew && existing && existing.projectId) { var ep = projectById(existing.projectId); proj = ep ? ep.name + '（不變）' : ''; }
+    var content = typeof a.content === 'string' ? a.content : '';
+    var preview = content.slice(0, 500) + (content.length > 500 ? '\n…（共 ' + content.length + ' 字）' : '');
+    return '<div class="sources-title">要' + escapeHtml(isNew ? '新增' : '修改') + '文件嗎？</div>' +
+      '<div class="doc-save-meta" style="font-size:0.85rem;margin:4px 0;line-height:1.6">' +
+        '<div>動作：<b>' + escapeHtml(action) + '</b></div>' +
+        '<div>標題：<b>' + escapeHtml(title || '（未提供）') + '</b></div>' +
+        '<div>專案：' + escapeHtml(proj || '（無）') + '</div>' +
+      '</div>' +
+      '<pre class="doc-save-preview" style="max-height:220px;overflow:auto;font-size:0.75rem;white-space:pre-wrap;margin:4px 0">' + escapeHtml(preview || '（空白）') + '</pre>' +
+      '<div style="display:flex;gap:6px"><button type="button" class="topbar-action-btn primary" data-act="allow">允許</button><button type="button" class="topbar-action-btn" data-act="deny">拒絕</button></div>';
+  }
+  // 工具新增／修改文件後，立即把該文件放進本機快取並刷新列表（不觸發回寫）
+  function applyServerDoc(sd) {
+    if (!sd || !sd.id) return;
+    var nd = docFromServer(sd), idx = -1;
+    for (var i = 0; i < documents.length; i++) if (documents[i] && documents[i].id === sd.id) idx = i;
+    if (idx >= 0) documents[idx] = nd; else documents.unshift(nd);
+    syncMeta.hashes['doc:' + sd.id] = storeHash(docForHash(nd));
+    syncMeta.srv['doc:' + sd.id] = sd.updated_at;
+    syncMeta.applying = true;
+    try { saveDocuments(); } finally { syncMeta.applying = false; }
+    saveSyncMeta();
+    try { renderKnowledgeList(); } catch(e) {}
+    try { renderSidebar(); } catch(e) {}
+    try { maybeBackfillEmbeddings(); } catch(e) {}
+  }
+  async function loadDocToolsSetting() {
+    var cb = document.getElementById('doc-tools-toggle');
+    var card = document.getElementById('doc-tools-card');
+    if (!cb || !card) return;
+    card.style.display = serverMode() ? '' : 'none';
+    if (!serverMode()) return;
+    if (!cb._bound) {
+      cb._bound = true;
+      cb.addEventListener('change', async function() {
+        try {
+          await storeFetch('PUT', '/api/settings', { 'tools.docs': !!cb.checked });
+          p5Status('doc-tools-status', cb.checked ? '已開啟文件工具。' : '已關閉文件工具，模型將無法讀寫文件。', false);
+        } catch(e) { cb.checked = !cb.checked; p5Status('doc-tools-status', '儲存失敗：' + (e.message || ''), true); }
+      });
+    }
+    try {
+      var st = (await storeFetch('GET', '/api/settings')).settings || {};
+      var v = st['tools.docs'];
+      cb.checked = !(v === false || v === 0 || v === '0' || String(v).toLowerCase() === 'false' || String(v).toLowerCase() === 'off');
+    } catch(e) { p5Status('doc-tools-status', '讀取失敗：' + (e.message || ''), true); }
   }
   function askToolPermission(container, call) {
     return new Promise(function(resolve) {
@@ -3954,7 +4027,8 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       try { args = JSON.stringify(JSON.parse(args), null, 2); } catch(e) {}
       var box = document.createElement('div');
       box.className = 'sources-box mcp-confirm';
-      box.innerHTML = '<div class="sources-title">要執行工具嗎？</div>' +
+      if (call.name === 'docs__save') box.innerHTML = docSaveConfirmHtml(call);
+      else box.innerHTML = '<div class="sources-title">要執行工具嗎？</div>' +
         '<div style="font-size:0.85rem;margin:4px 0"><b>' + escapeHtml(lb.tool) + '</b>' + (lb.server ? '（' + escapeHtml(lb.server) + '）' : '') + '</div>' +
         '<pre style="max-height:220px;overflow:auto;font-size:0.75rem;white-space:pre-wrap;margin:4px 0">' + escapeHtml(args) + '</pre>' +
         '<div style="display:flex;gap:6px"><button type="button" class="topbar-action-btn primary" data-act="allow">允許</button><button type="button" class="topbar-action-btn" data-act="deny">拒絕</button></div>';
@@ -3978,6 +4052,22 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       for (var i = 0; i < calls.length; i++) {
         var c = calls[i];
         if (!c.id) c.id = 'call_' + round + '_' + i;
+        if (isAutoTool(c.name)) {
+          // 唯讀文件工具：不顯示確認卡，只留一行小字
+          var line = document.createElement('div');
+          line.className = 'settings-hint doc-tool-line';
+          line.textContent = '正在使用文件工具…';
+          if (col) col.appendChild(line);
+          try {
+            var ra = await storeFetch('POST', '/api/tools/call', { name: c.name, arguments: c.arguments });
+            results.push({ id: c.id, content: (ra.result.is_error ? '工具回報錯誤：' : '') + ra.result.content });
+            line.textContent = ra.result.summary || (ra.result.is_error ? '文件工具回報錯誤。' : '已使用文件工具。');
+          } catch(e) {
+            results.push({ id: c.id, content: '工具執行失敗：' + (e.message || '') });
+            line.textContent = '文件工具執行失敗：' + (e.message || '');
+          }
+          continue;
+        }
         var ans = await askToolPermission(col, c);
         var note = document.createElement('div');
         note.className = 'settings-hint';
@@ -3989,9 +4079,10 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
           note.textContent = '執行中…';
           ans.box.appendChild(note);
           try {
-            var r = await storeFetch('POST', '/api/mcp/call', { name: c.name, arguments: c.arguments });
+            var r = await storeFetch('POST', '/api/tools/call', { name: c.name, arguments: c.arguments });
             results.push({ id: c.id, content: (r.result.is_error ? '工具回報錯誤：' : '') + r.result.content });
-            note.textContent = r.result.is_error ? '工具回報錯誤。' : '已執行。';
+            note.textContent = r.result.is_error ? ('工具回報錯誤' + (r.result.content ? '：' + String(r.result.content).slice(0, 200) : '。')) : (r.result.summary || '已執行。');
+            if (!r.result.is_error && r.result.item) applyServerDoc(r.result.item);
           } catch(e) {
             results.push({ id: c.id, content: '工具執行失敗：' + (e.message || '') });
             note.textContent = '執行失敗：' + (e.message || '');
@@ -5958,7 +6049,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
   function showSettingsPane(id) {
     if (id === 'pane-skills') loadSkills();
     if (id === 'pane-memory') loadMemories();
-    if (id === 'pane-providers') { loadEmbeddingPane(); loadKeywordPane(); loadWebSearchPane(); loadMcpPane(); }
+    if (id === 'pane-providers') { loadEmbeddingPane(); loadKeywordPane(); loadWebSearchPane(); loadMcpPane(); loadDocToolsSetting(); }
     if (id === 'pane-data') { loadKeyStatus(); var bc = document.getElementById('backup-card'); if (bc) bc.style.display = serverMode() ? '' : 'none'; }
     document.querySelectorAll('.settings-pane').forEach(function(p) { p.classList.toggle('active', p.id === id); });
     document.querySelectorAll('.settings-nav-btn').forEach(function(b) { b.classList.toggle('active', b.getAttribute('data-pane') === id); });

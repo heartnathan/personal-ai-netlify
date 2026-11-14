@@ -5,7 +5,7 @@
 主要功能：
 
 - **多供應商聊天**：任何 OpenAI 相容服務（含無 API Key 的自架模型），模型選單依供應商分組；Edge 串流，回答由伺服器保存，關頁不遺失。
-- **知識庫**：上傳 PDF／DOCX／文字檔自動抽文字切塊；中文斷詞 BM25＋語意向量混合檢索。
+- **知識庫**：上傳 PDF／DOCX／文字檔自動抽文字切塊；中文斷詞 BM25＋語意向量混合檢索；聊天模型可用內建「文件工具」自行列出、搜尋、讀取文件，新增或修改需你按「允許」。
 - **網頁搜尋**：Jina 或 Tavily，只在需要時搜尋，回答只附有引用的來源。
 - **MCP 工具**：接遠端 MCP 伺服器，每次呼叫都要使用者按「允許」。
 - **技能與記憶**：自訂技能注入系統提示；長期記憶由使用者確認後才寫入。
@@ -14,7 +14,7 @@
 
 技術：Netlify Functions／Edge Functions＋Neon Postgres（pgvector）＋S3 相容物件儲存。由 [`scupro/personal-ai`](https://github.com/scupro/personal-ai)（Cloudflare Workers＋D1）移植而來。
 
-> **狀態**：已正式部署，含 MCP 工具與伺服器端保存回答；70 項測試通過。
+> **狀態**：已正式部署，含 MCP 工具、文件工具與伺服器端保存回答；75 項測試通過。
 > 尚未實測：真實 MCP 伺服器、Neon Object Storage、中文 BM25（lakebase）、Jina／Tavily 網頁搜尋、用戶端斷線後 Edge 背景保存回答。
 
 - 完整架構與設計理由：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
@@ -30,6 +30,7 @@
 | 聊天 | `/api/chat` 由 Edge Function 串流代理（不受 Functions 60 秒同步上限）。**回答由伺服器收齊後寫入對話**（串流分兩路：一路給瀏覽器、一路在 `context.waitUntil` 背景收集），關掉或重新整理頁面也不會遺失；訊息以 `mid` 去重。按「停止」時以前端保存的部分回答為準，但上游仍會生成到結束（消耗 token） |
 | 供應商與模型 | **沒有內建供應商**。來源只有兩種：設定面板新增（Key 加密存資料庫）與 `PROVIDER_N_*` 環境變數（唯讀，Key 不進資料庫也不到瀏覽器）。任何 OpenAI 相容服務皆可，**允許空 API Key**（自架模型）；聊天模型與嵌入模型分開設定；模型選單**依供應商分組**；預設模型在面板選；可從供應商自動探索模型 |
 | 資料 | 個人資料、設定、介面偏好、對話、專案、Prompt、知識庫文件全部存 Neon |
+| 文件工具 | 內建 `docs__list`／`docs__search`／`docs__read`（免確認）與 `docs__save`（確認卡，按「允許」才寫入）；設定 → 供應商可關閉 |
 | 檔案 | 瀏覽器以 presigned URL 直傳物件儲存（不經 Function）；PDF（pdf.js）與 DOCX（mammoth）在瀏覽器端抽文字，伺服器切塊（約 1200 字、重疊 150）寫入知識庫 |
 | 檢索 | 關鍵字＋語意向量，以 RRF（k=60）合併；嵌入失敗自動退回關鍵字。關鍵字預設用 Neon 中文斷詞＋BM25（0004），未啟用、沒結果或出錯時退回二字組（英數詞＋中文二字組＋全文分數），可在面板切換 |
 | 語意嵌入 | **預設關閉**（只用關鍵字）；在面板選任一供應商的嵌入模型即開啟（例如 Cloudflare Workers AI `@cf/baai/bge-m3`、Cohere `embed-v5.0-pro`、OpenAI `text-embedding-3-small`） |
@@ -93,6 +94,7 @@ test/                                  node:test；資料庫測試以 PGlite 實
 | `/api/files`、`/:id/complete`、`/:id/download` | 上傳（presign）、完成、下載 |
 | `/api/memories`、`/api/memories/suggest` | 記憶、記憶建議 |
 | `/api/embeddings/status`、`/config`、`/backfill` | 嵌入狀態（含各供應商嵌入模型 `options`）、設定 `{provider_id, model}` 或 `{reset:true}` 關閉、補建向量 |
+| `/api/tools/call` | 統一工具呼叫：`docs__*` 走內建文件工具，其餘轉 MCP（前端只呼叫這支） |
 | `/api/mcp/servers`、`/:id`、`/:id/refresh`、`/api/mcp/call` | MCP 伺服器清單／新增／修改（啟用、停用個別工具、換 Token）／刪除／重新取得工具；執行工具（前端在使用者允許後才呼叫） |
 | `/api/backup`、`/api/backup/restore` | 匯出、還原 |
 | `/api/admin/keys`、`/api/admin/rekey` | 金鑰狀態、重新加密 |
@@ -133,7 +135,7 @@ test/                                  node:test；資料庫測試以 PGlite 實
 
 ```bash
 npm install
-npm test                 # 70 項；不需要真的資料庫（PGlite）
+npm test                 # 75 項；不需要真的資料庫（PGlite）
 npm run gen:key          # 產生 ENCRYPTION_KEY
 npm run build            # 由 src/web_decoded.html 產生 public/
 DATABASE_URL=... npm run db:migrate
@@ -450,7 +452,7 @@ TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxx
 - 傳輸：只支援 **Streamable HTTP**（MCP 規格 2025-06-18，https://modelcontextprotocol.io/specification/2025-06-18/basic/transports ），網址須 HTTPS、不可指向內網。Netlify Functions 不能啟動子行程，所以 stdio（本機指令）類 MCP 伺服器無法使用；舊版 HTTP+SSE（2024-11-05）傳輸也未支援。
 - Token：加密（AES-256-GCM）存在 `settings` 的 `secret.mcp.<id>`，不經 `/api/settings` 回傳、不進備份，金鑰輪替時一併重新加密。標頭為 `Authorization` 且 Token 沒寫 `Bearer` 時自動補上。
 - 工具：每台伺服器最多 50 個、全部最多 64 個交給模型；可取消勾選個別工具或停用整台伺服器。工具清單在新增、換 Token、按「重新連線」時更新。
-- **確認**：伺服器只把工具清單交給模型，不會自己執行。模型要呼叫工具時，對話中出現確認卡（工具名稱、所屬伺服器、參數），按「允許」才呼叫 `/api/mcp/call`，按「拒絕」則告訴模型使用者拒絕；結果送回模型繼續回答，最多 5 回合。
+- **確認**：伺服器只把工具清單交給模型，不會自己執行。模型要呼叫工具時，對話中出現確認卡（工具名稱、所屬伺服器、參數），按「允許」才呼叫 `/api/tools/call`（舊路徑 `/api/mcp/call` 仍可用），按「拒絕」則告訴模型使用者拒絕；結果送回模型繼續回答，最多 5 回合。
 - 需求：聊天模型要支援 OpenAI 格式的 tool calling（`tools`／`tool_calls`）。不支援的模型可能報錯，可在面板停用 MCP 伺服器。
 - 限制：工具結果最多 12,000 字；單次呼叫逾時 45 秒；對話記錄只保存文字回答，不保存工具參數與結果。
 
@@ -461,6 +463,23 @@ TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxx
 3. 直接提出需要該工具的問題；啟用的工具會自動附在每次聊天請求中（`tool_choice: auto`），不需另外開關。
 4. 模型決定呼叫時出現確認卡，按「允許」執行。想提高呼叫機率，可在問題裡點名工具，例如「用 XX 工具查……」。
 5. 沒出現確認卡：多半是模型不支援工具或判斷不需要；換模型或改問法。確認卡需要頁面開著，關頁後不會執行工具。
+
+## 文件工具
+
+內建工具，讓聊天模型主動使用知識庫（不需要 MCP 伺服器）。和每次發問自動附上的「知識庫片段」並存：片段是被動檢索，工具讓模型在片段不夠時自己去找、去讀，或依你的要求存成文件。
+
+| 工具 | 用途 | 確認 |
+|---|---|---|
+| `docs__list` | 列出文件（id、標題、專案、類型、字數、更新時間），可依專案（id 或名稱）或標題關鍵字篩選，最多 50 筆；並附現有專案清單 | 免確認，對話中只顯示一行小字 |
+| `docs__search` | 以與知識庫相同的混合檢索找片段，回 `document_id` | 免確認 |
+| `docs__read` | 依 id 讀全文；每次最多 20,000 字，回 `total_length`／`next_offset` 讓模型分段讀 | 免確認 |
+| `docs__save` | 不帶 id ＝新增筆記；帶 id ＝修改（`mode`：`replace` 取代全文、`append` 接在文末）；`project_id` 可填專案名稱，找不到時回錯誤並列出現有專案 | **每次都顯示確認卡**（動作、標題、專案、內容前 500 字），按「允許」才寫入 |
+
+- 開關：設定 → 供應商 →「文件工具」勾選「讓模型使用文件工具（讀取免確認，寫入需確認）」，對應 `settings` 的 `tools.docs`（預設開啟）。關閉後不提供給模型，伺服器也拒絕執行。
+- 寫入後立即重新切塊（可被關鍵字檢索），前端同步更新文件列表；有設定語意檢索時，向量在背景補齊。
+- 由上傳檔案抽出的文件不能用工具修改（避免與原檔不一致），模型可另存一份新文件。沒有資料夾功能，請用專案分類。
+- 誠實規則：有提供工具時，系統提示要求模型只能在工具回傳成功後才說「已儲存」；沒有工具（或文件工具關閉）時，模型會被告知無法自行存檔、請你手動儲存。
+- MCP 工具的確認規則不變：每次都要按「允許」。
 
 ## API Key 加密金鑰輪替
 

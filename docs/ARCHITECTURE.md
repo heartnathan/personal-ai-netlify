@@ -43,6 +43,7 @@ Netlify CDN ── public/（app.js / app.css / i18n，immutable 快取）
 | — | `/api/conversations[/:id[/messages]]` | 新 |
 | — | `/api/{projects,documents,skills,memories,prompts}[/:id]` | 新，通用 CRUD |
 | — | `/api/documents/search?q=` | 新，知識庫檢索 |
+| — | `/api/tools/call` | 新，統一工具呼叫（`docs__*` 內建文件工具，其餘轉 MCP） |
 | 靜態檔 `/assets/*` | Netlify CDN（`public/_headers` 沿用） | |
 
 ### 1.2 平台限制與影響
@@ -205,8 +206,15 @@ Edge Functions（[limits](https://docs.netlify.com/build/edge-functions/limits/)
 
 - `src/mcp.js`：`settings.mcp.servers` = [{id, name, url, header_name, enabled, disabled_tools, tools(快取), tools_at, tools_error}]；Token 存 `secret.mcp.<id>`（AES-256-GCM）。Streamable HTTP 客戶端：每則 JSON-RPC 一次 POST、`Accept: application/json, text/event-stream`、JSON 或 SSE 回應皆可、`Mcp-Session-Id` 與 `MCP-Protocol-Version` 標頭、`redirect: manual`；每次操作重新 initialize（無狀態，適合 Functions／Edge）。
 - function 名稱 `<serverId>__<工具名>`（≤64 字元、只含英數 `_-`），`/api/mcp/call` 依名稱對回伺服器與工具，停用的伺服器或工具拒絕執行。
-- Edge `/api/chat` 以 `resolveTools` 注入 `tools`（`tool_choice: auto`），回應標頭 `X-Tool-Count`；前端累積 `delta.tool_calls`，顯示確認卡，允許後呼叫 `/api/mcp/call`，再以 `tool_turns`（assistant＋tool 訊息，接在 `normalizeRoles` 之後）重送 `/api/chat`，最多 5 回合。執行在 Function（60 秒上限），呼叫逾時 45 秒。
+- Edge `/api/chat` 以 `resolveTools` 注入 `tools`（`tool_choice: auto`），回應標頭 `X-Tool-Count`；前端累積 `delta.tool_calls`，顯示確認卡，允許後呼叫 `/api/tools/call`（舊 `/api/mcp/call` 保留），再以 `tool_turns`（assistant＋tool 訊息，接在 `normalizeRoles` 之後）重送 `/api/chat`，最多 5 回合。執行在 Function（60 秒上限），呼叫逾時 45 秒。
 - 備份還原會略過 `secret.*` 設定。
+
+## 3.8.1 文件工具（內建）
+
+- `src/doc_tools.js`：`docs__list`、`docs__search`（`hybridSearch`，失敗退回 `searchDocuments`）、`docs__read`（`offset`／`max_chars` ≤ 20,000，回 `total_length`、`next_offset`）、`docs__save`（無 id 用 `createEntity` 新增 `doc_type: note`；有 id 用 `updateEntity`，`mode` replace|append；兩者都會重切 `doc_chunks`）。專案參數接受 id 或名稱（完全相符，或唯一的部分相符），找不到回錯誤並列出現有專案。`file_id` 不為空的文件拒絕修改。輸入錯誤以 `is_error` 回給模型，讓它修正後重試。
+- 注入：`resolveAllTools(db, resolveMcpTools)` 合併內建文件工具與 MCP 工具（任一來源失敗不影響另一個）；`settings.tools.docs` 為 false 時不含文件工具，`callDocTool` 也拒絕。`body.use_tools === false` 時全部不送。
+- 系統提示：`handleChat` 先決定 tools，再以伺服器設定的 `__toolNames`（前端送來的同名欄位會被刪除）加入誠實規則：有工具時「只有工具回傳成功才可說已儲存」；沒有 `docs__save` 時「你無法自行儲存文件，請使用者手動儲存」。規則併入唯一一則 system（`normalizeRoles`）。
+- 執行：前端統一呼叫 `POST /api/tools/call`（`/api/mcp/call` 保留相容）。`docs__list/search/read` 不顯示確認卡、直接執行，只留一行摘要；`docs__save` 顯示確認卡（動作、標題、專案、內容前 500 字），允許後執行，回傳的 `item` 直接寫入前端 documents 快取（同步雜湊一併更新，不會回寫），並觸發 `maybeBackfillEmbeddings`。工具結果上限 24,000 字（MCP 仍為 12,000），工具參數上限放寬到約 200,000 字以容納 `docs__save` 內容。
 
 ## 3.9 伺服器端保存回答
 
