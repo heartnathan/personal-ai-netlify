@@ -202,6 +202,21 @@
     .history-item:hover .history-del-btn, .doc-item:hover .mini-x, .proj-item:hover .mini-x { opacity: 1; }
     .history-del-btn:hover, .mini-x:hover { color: var(--red); }
     .empty-side { font-size: 0.75rem; color: var(--dim); padding: 10px 8px; }
+    /* 文件頁：依專案分組的可折疊資料夾 */
+    .doc-folder { display: flex; flex-direction: column; }
+    .doc-folder-row { display: flex; align-items: center; gap: 2px; }
+    .doc-folder-head { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; padding: 7px 8px; border: 0; background: transparent; color: var(--text); font-size: 0.8rem; font-weight: 600; text-align: left; cursor: pointer; border-radius: 8px; }
+    .doc-folder-head:hover { background: rgba(127,127,127,0.12); }
+    .doc-folder-caret { display: inline-block; width: 10px; color: var(--dim); transition: transform .12s; }
+    .doc-folder.open .doc-folder-caret { transform: rotate(90deg); }
+    .doc-folder-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .doc-folder-count { font-size: 0.68rem; color: var(--dim); font-weight: 500; }
+    .doc-folder-add { border: 0; background: transparent; color: var(--dim); cursor: pointer; padding: 2px 8px; border-radius: 6px; font-size: 0.9rem; }
+    .doc-folder-add:hover { color: var(--text); background: rgba(127,127,127,0.12); }
+    .doc-folder-body { display: none; flex-direction: column; gap: 2px; padding-left: 14px; }
+    .doc-folder.open .doc-folder-body { display: flex; }
+    .doc-folder-empty { font-size: 0.72rem; color: var(--dim); padding: 4px 10px; }
+    .kb-group-title { font-size: 0.7rem; color: var(--dim); font-weight: 600; margin: 8px 0 4px; }
     .sb-foot { padding: 10px 12px 14px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
     .sb-link {
       display: flex; align-items: center; gap: 8px; background: transparent; border: 0; color: var(--muted);
@@ -1824,6 +1839,10 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       <div class="form-group">
         <label class="form-label">Título</label>
         <input type="text" id="train-title" class="form-input" placeholder="Especificación, notas, reglas…">
+      </div>
+      <div class="form-group">
+        <label class="form-label">專案（資料夾）</label>
+        <select id="train-project" class="form-input"><option value="">未分類</option></select>
       </div>
       <div class="form-group">
         <label class="form-label">Contenido</label>
@@ -4044,28 +4063,116 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
     });
   }
   function newMid() { return 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+  // 工具回合上限：第 MAX_TOOL_ROUNDS 回合的後續請求不再送工具（tools_exhausted），強制模型根據已取得的結果回答
+  var MAX_TOOL_ROUNDS = 8;
+  var DUP_TOOL_NOTE = '（與先前相同的呼叫，結果同上，請直接使用先前結果）';
+  // 參數 JSON 正規化（鍵排序、去空白）；不是 JSON 時用原字串
+  function canonJson(v) {
+    if (Array.isArray(v)) return '[' + v.map(canonJson).join(',') + ']';
+    if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map(function(k) { return JSON.stringify(k) + ':' + canonJson(v[k]); }).join(',') + '}';
+    return JSON.stringify(v === undefined ? null : v);
+  }
+  function toolCallKey(name, args) {
+    var a = args;
+    if (typeof a === 'string') { try { a = a.trim() ? JSON.parse(a) : {}; } catch(e) { return String(name) + '|' + a.trim(); } }
+    return String(name) + '|' + canonJson(a || {});
+  }
+  // 工具小字：工具名與重點參數（列出文件／搜尋：關鍵字／讀取：標題）
+  function toolCallLabel(name, args) {
+    var a = {};
+    try { a = (typeof args === 'string' ? JSON.parse(args || '{}') : args) || {}; } catch(e) { a = {}; }
+    var short = function(v, n) { v = String(v == null ? '' : v); return v.length > (n || 40) ? v.slice(0, n || 40) + '…' : v; };
+    var projName = function(v) {
+      if (v == null || !String(v).trim()) return '';
+      var pr = projectById(String(v));
+      if (!pr) for (var k = 0; k < projects.length; k++) if (projects[k] && String(projects[k].name || '').toLowerCase() === String(v).toLowerCase()) pr = projects[k];
+      return pr ? pr.name : String(v);
+    };
+    if (name === 'docs__list') {
+      var bits = [];
+      if (projName(a.project_id)) bits.push('資料夾「' + short(projName(a.project_id), 30) + '」');
+      if (a.query) bits.push('標題含「' + short(a.query, 30) + '」');
+      return '列出文件' + (bits.length ? '：' + bits.join('，') : '');
+    }
+    if (name === 'docs__search') return '搜尋：' + short(a.query) + (projName(a.project_id) ? '（' + short(projName(a.project_id), 30) + '）' : '');
+    if (name === 'docs__read') {
+      var title = '';
+      for (var i = 0; i < documents.length; i++) if (documents[i] && documents[i].id === String(a.id)) title = documents[i].title;
+      return '讀取：' + short(title || a.id || '（未指定）') + (a.offset ? '（從第 ' + a.offset + ' 字）' : '');
+    }
+    if (name === 'docs__save') return (a.id ? '修改文件：' : '儲存：') + short(a.title || a.id || '');
+    var lb = toolLabel(name);
+    return '工具：' + lb.tool + (lb.server ? '（' + lb.server + '）' : '');
+  }
+  async function streamToolRound(payload, tc) {
+    var resp = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: abortCtl ? abortCtl.signal : undefined, body: JSON.stringify(payload) });
+    if (!resp.ok) { var ej = await resp.json().catch(function() { return {}; }); throw new Error(ej.message || ej.error || ('HTTP ' + resp.status)); }
+    var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '', text = '', calls = [];
+    while (true) {
+      var ch = await reader.read();
+      if (ch.done) break;
+      buf += dec.decode(ch.value, { stream: true });
+      var lines = buf.split(String.fromCharCode(10)); buf = lines.pop() || '';
+      for (var j = 0; j < lines.length; j++) {
+        var tr = lines[j].trim();
+        if (!tr.startsWith('data:')) continue;
+        var ds = tr.replace(/^data:\s*/, '');
+        if (ds === '[DONE]') continue;
+        var p; try { p = JSON.parse(ds); } catch(e) { continue; }
+        if (p.error) throw new Error(typeof p.error === 'string' ? p.error : (p.error.message || '供應商錯誤'));
+        var d = p.content;
+        if (!d && p.choices && p.choices[0]) {
+          var cc = p.choices[0];
+          d = (cc.delta && cc.delta.content) || (cc.message && cc.message.content) || '';
+          if (cc.delta && Array.isArray(cc.delta.tool_calls)) mergeToolCallDeltas(calls, cc.delta.tool_calls);
+        }
+        if (d) { text += d; if (tc) { tc.innerHTML = renderMarkdown(text) + '<span class="pulse-cursor"></span>'; scrollToEnd(); } }
+      }
+    }
+    if (tc) tc.innerHTML = renderMarkdown(text);
+    return { resp: resp, text: text, calls: calls.filter(Boolean) };
+  }
   async function runToolLoop(basePayload, firstText, firstCalls, contentCol, textContainer) {
     var turns = [], roundMid = '';
+    var seen = {}; // 同一輪問答的工具呼叫去重：key → 先前結果
     var text = firstText, calls = firstCalls, col = contentCol, tc = textContainer, resp = null, srcs = null;
-    for (var round = 0; round < 5 && calls.length; round++) {
+    for (var round = 0; calls.length; round++) {
       var results = [];
       for (var i = 0; i < calls.length; i++) {
         var c = calls[i];
         if (!c.id) c.id = 'call_' + round + '_' + i;
+        var key = toolCallKey(c.name, c.arguments);
+        var dedupe = isAutoTool(c.name) || c.name === 'docs__save';
         if (isAutoTool(c.name)) {
-          // 唯讀文件工具：不顯示確認卡，只留一行小字
+          // 唯讀文件工具：不顯示確認卡，只留一行小字（工具名＋重點參數）
+          var label = toolCallLabel(c.name, c.arguments);
           var line = document.createElement('div');
           line.className = 'settings-hint doc-tool-line';
-          line.textContent = '正在使用文件工具…';
+          line.textContent = label + '…';
           if (col) col.appendChild(line);
+          if (seen[key]) {
+            results.push({ id: c.id, content: DUP_TOOL_NOTE });
+            line.textContent = label + ' → 重複呼叫，沿用先前結果';
+            continue;
+          }
           try {
             var ra = await storeFetch('POST', '/api/tools/call', { name: c.name, arguments: c.arguments });
             results.push({ id: c.id, content: (ra.result.is_error ? '工具回報錯誤：' : '') + ra.result.content });
-            line.textContent = ra.result.summary || (ra.result.is_error ? '文件工具回報錯誤。' : '已使用文件工具。');
+            line.textContent = label + ' → ' + (ra.result.summary || (ra.result.is_error ? '文件工具回報錯誤。' : '完成'));
+            if (!ra.result.is_error) seen[key] = 1;
           } catch(e) {
             results.push({ id: c.id, content: '工具執行失敗：' + (e.message || '') });
-            line.textContent = '文件工具執行失敗：' + (e.message || '');
+            line.textContent = label + ' → 執行失敗：' + (e.message || '');
           }
+          continue;
+        }
+        if (dedupe && seen[key]) {
+          // docs__save 相同內容：不再詢問、不重複寫入
+          var dl = document.createElement('div');
+          dl.className = 'settings-hint doc-tool-line';
+          dl.textContent = toolCallLabel(c.name, c.arguments) + ' → 重複呼叫，未再執行';
+          if (col) col.appendChild(dl);
+          results.push({ id: c.id, content: seen[key] === 'denied' ? '使用者已拒絕過相同的呼叫，請不要再嘗試，直接回答使用者。' : DUP_TOOL_NOTE });
           continue;
         }
         var ans = await askToolPermission(col, c);
@@ -4075,6 +4182,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
         if (!ans.allowed) {
           results.push({ id: c.id, content: '使用者拒絕執行這個工具。' });
           note.textContent = '已拒絕。';
+          if (dedupe) seen[key] = 'denied';
         } else {
           note.textContent = '執行中…';
           ans.box.appendChild(note);
@@ -4083,6 +4191,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
             results.push({ id: c.id, content: (r.result.is_error ? '工具回報錯誤：' : '') + r.result.content });
             note.textContent = r.result.is_error ? ('工具回報錯誤' + (r.result.content ? '：' + String(r.result.content).slice(0, 200) : '。')) : (r.result.summary || '已執行。');
             if (!r.result.is_error && r.result.item) applyServerDoc(r.result.item);
+            if (dedupe && !r.result.is_error) seen[key] = 1;
           } catch(e) {
             results.push({ id: c.id, content: '工具執行失敗：' + (e.message || '') });
             note.textContent = '執行失敗：' + (e.message || '');
@@ -4091,42 +4200,27 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
         if (!note.parentNode) ans.box.appendChild(note);
       }
       turns.push({ content: text || '', tool_calls: calls.map(function(c) { return { id: c.id, name: c.name, arguments: c.arguments || '{}' }; }), results: results });
-      var roundMid = newMid();
+      // 已用完回合：最後這次請求不送工具，伺服器把工具結果轉成文字並要求直接回答
+      var lastRound = round >= MAX_TOOL_ROUNDS - 1;
+      roundMid = newMid();
       var payload2 = Object.assign({}, basePayload, { tool_turns: turns, search_web: false });
+      if (lastRound) { payload2.use_tools = false; payload2.tools_exhausted = true; }
       if (basePayload.persist) payload2.persist = Object.assign({}, basePayload.persist, { user: null, assistant_mid: roundMid });
       var dom = addMessageToDOM('ai', '');
       col = dom.contentCol; tc = dom.textContainer;
       if (tc) tc.innerHTML = '<span class="pulse-cursor"></span>';
-      resp = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: abortCtl ? abortCtl.signal : undefined, body: JSON.stringify(payload2) });
-      if (!resp.ok) { var ej = await resp.json().catch(function() { return {}; }); throw new Error(ej.message || ej.error || ('HTTP ' + resp.status)); }
-      var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '';
-      text = ''; calls = [];
-      while (true) {
-        var ch = await reader.read();
-        if (ch.done) break;
-        buf += dec.decode(ch.value, { stream: true });
-        var lines = buf.split(String.fromCharCode(10)); buf = lines.pop() || '';
-        for (var j = 0; j < lines.length; j++) {
-          var tr = lines[j].trim();
-          if (!tr.startsWith('data:')) continue;
-          var ds = tr.replace(/^data:\s*/, '');
-          if (ds === '[DONE]') continue;
-          var p; try { p = JSON.parse(ds); } catch(e) { continue; }
-          if (p.error) throw new Error(typeof p.error === 'string' ? p.error : (p.error.message || '供應商錯誤'));
-          var d = p.content;
-          if (!d && p.choices && p.choices[0]) {
-            var cc = p.choices[0];
-            d = (cc.delta && cc.delta.content) || (cc.message && cc.message.content) || '';
-            if (cc.delta && Array.isArray(cc.delta.tool_calls)) mergeToolCallDeltas(calls, cc.delta.tool_calls);
-          }
-          if (d) { text += d; if (tc) { tc.innerHTML = renderMarkdown(text) + '<span class="pulse-cursor"></span>'; scrollToEnd(); } }
+      var out = await streamToolRound(payload2, tc);
+      resp = out.resp; text = out.text; calls = out.calls;
+      if (lastRound) {
+        calls = [];
+        if (!text.trim()) {
+          text = '（模型在工具使用次數用完後沒有給出回答。）';
+          if (tc) tc.innerHTML = '<p class="settings-hint tool-final-error">' + escapeHtml(text) + '</p>';
         }
+        break;
       }
-      if (tc) tc.innerHTML = renderMarkdown(text);
-      calls = calls.filter(Boolean);
       if (calls.length && text) { chats[currentChatId].messages.push({ role: 'ai', content: text, sources: [], at: Date.now(), mid: roundMid }); saveChats(); }
     }
-    if (calls.length && tc) tc.innerHTML = renderMarkdown(text) + '<p class="settings-hint">已達工具呼叫上限（5 回合）。</p>';
     return { text: text, contentCol: col, textContainer: tc, response: resp, sources: srcs, mid: roundMid };
   }
   function citedSources(list, text) {
@@ -4933,7 +5027,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       }
       if (textContainer) textContainer.innerHTML = renderMarkdown(fullText);
       if (toolCalls.length) {
-        // MCP：模型要求呼叫工具 → 顯示確認卡，使用者允許才執行，結果送回模型繼續回答（最多 5 回合）
+        // 工具：唯讀文件工具直接執行，其餘顯示確認卡；結果送回模型繼續回答（最多 8 回合，用完強制回答）
         if (fullText) { chats[currentChatId].messages.push({ role: 'ai', content: fullText, sources: [], at: Date.now(), mid: aiMid }); saveChats(); }
         var loopOut = await runToolLoop(payload, fullText, toolCalls.filter(Boolean), contentCol, textContainer);
         fullText = loopOut.text; contentCol = loopOut.contentCol; textContainer = loopOut.textContainer; aiMid = loopOut.mid || aiMid;
@@ -5806,6 +5900,26 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
     d.card.id = 'proj-dialog';
   }
 
+  // 文件依專案分組：專案即資料夾；沒有專案（或專案已不存在）的放「未分類」
+  function docFolders(docs) {
+    var groups = [], byKey = {};
+    projects.forEach(function(p) {
+      if (!p || !p.id) return;
+      var g = { key: p.id, projectId: p.id, name: p.name || '未命名專案', docs: [] };
+      byKey[p.id] = g; groups.push(g);
+    });
+    var none = { key: '__none', projectId: null, name: '未分類', docs: [] };
+    docs.forEach(function(d) { (d.projectId && byKey[d.projectId] ? byKey[d.projectId] : none).docs.push(d); });
+    groups.push(none);
+    return groups;
+  }
+  function docFolderState() {
+    try { var v = JSON.parse(localStorage.getItem('ta_doc_folders') || '{}'); return v && typeof v === 'object' ? v : {}; } catch(e) { return {}; }
+  }
+  function setDocFolderOpen(key, open) {
+    var st = docFolderState(); st[key] = !!open;
+    try { localStorage.setItem('ta_doc_folders', JSON.stringify(st)); } catch(e) {}
+  }
   function renderDocsList(list, filterText) {
     var head = document.createElement('button');
     head.type = 'button';
@@ -5819,29 +5933,77 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       if (filterText && !(d.title || '').toLowerCase().includes(filterText)) return false;
       return true;
     });
-    if (!filtered.length) {
+    var folders = docFolders(filtered).filter(function(g) {
+      if (currentProjectId && g.projectId && g.projectId !== currentProjectId) return false;
+      // 搜尋時只顯示有符合文件的資料夾；未分類沒有文件時也不顯示
+      if (filterText || !g.projectId) return g.docs.length > 0;
+      return true;
+    });
+    if (!filtered.length && !folders.length) {
       var emptyD = document.createElement('div');
       emptyD.className = 'empty-side';
       emptyD.textContent = t('noDocs');
       list.appendChild(emptyD);
       return;
     }
-    filtered.slice().reverse().forEach(function(d) {
-      var item = document.createElement('div');
-      item.className = 'doc-item';
-      item.innerHTML = '<span class="doc-title">' + escapeHtml(d.title || 'Documento') + '</span>' +
-        '<button class="mini-x" data-del-doc="' + d.id + '">✕</button>';
-      item.onclick = function(e) {
-        if (e.target.getAttribute('data-del-doc')) {
-          if (d.fileId && serverFilesEnabled) { deleteServerFile(d.fileId); return; }
-          documents = documents.filter(function(x) { return x.id !== d.id; });
-          saveDocuments();
-          renderSidebar();
-          return;
-        }
-        openArtifact({ title: d.title, content: d.content, lang: d.lang || 'text' }, { focus: true });
+    var st = docFolderState();
+    folders.forEach(function(g) {
+      var open = filterText ? true : (st[g.key] !== undefined ? !!st[g.key] : (g.projectId ? g.projectId === currentProjectId : true));
+      var box = document.createElement('div');
+      box.className = 'doc-folder' + (open ? ' open' : '');
+      box.setAttribute('data-folder', g.key);
+      var row = document.createElement('div');
+      row.className = 'doc-folder-row';
+      var hb = document.createElement('button');
+      hb.type = 'button';
+      hb.className = 'doc-folder-head';
+      hb.setAttribute('aria-expanded', open ? 'true' : 'false');
+      hb.innerHTML = '<span class="doc-folder-caret" aria-hidden="true">▸</span>' +
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>' +
+        '<span class="doc-folder-name">' + escapeHtml(g.name) + '</span><span class="doc-folder-count">' + g.docs.length + '</span>';
+      hb.onclick = function() {
+        var now = !box.classList.contains('open');
+        box.classList.toggle('open', now);
+        hb.setAttribute('aria-expanded', now ? 'true' : 'false');
+        setDocFolderOpen(g.key, now);
       };
-      list.appendChild(item);
+      var add = document.createElement('button');
+      add.type = 'button';
+      add.className = 'doc-folder-add';
+      add.setAttribute('data-folder-add', g.key);
+      add.title = '在「' + g.name + '」新增文件';
+      add.setAttribute('aria-label', add.title);
+      add.textContent = '+';
+      add.onclick = function(e) { e.stopPropagation(); openKnowledgeModal(g.projectId || ''); };
+      row.appendChild(hb); row.appendChild(add);
+      var body = document.createElement('div');
+      body.className = 'doc-folder-body';
+      if (!g.docs.length) {
+        var em = document.createElement('div');
+        em.className = 'doc-folder-empty';
+        em.textContent = '（沒有文件）';
+        body.appendChild(em);
+      }
+      g.docs.slice().reverse().forEach(function(d) {
+        var item = document.createElement('div');
+        item.className = 'doc-item';
+        item.setAttribute('data-doc', d.id);
+        item.innerHTML = '<span class="doc-title">' + (d.fileId ? '<span class="doc-file-tag">檔案</span>' : '') + escapeHtml(d.title || 'Documento') + '</span>' +
+          '<button class="mini-x" data-del-doc="' + escapeHtml(d.id) + '">✕</button>';
+        item.onclick = function(e) {
+          if (e.target.getAttribute('data-del-doc')) {
+            if (d.fileId && serverFilesEnabled) { deleteServerFile(d.fileId); return; }
+            documents = documents.filter(function(x) { return x.id !== d.id; });
+            saveDocuments();
+            renderSidebar();
+            return;
+          }
+          openArtifact({ title: d.title, content: d.content, lang: d.lang || 'text' }, { focus: true });
+        };
+        body.appendChild(item);
+      });
+      box.appendChild(row); box.appendChild(body);
+      list.appendChild(box);
     });
   }
 
@@ -5855,7 +6017,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       type: doc.type || 'note',
       lang: doc.lang || '',
       created: Date.now(),
-      projectId: currentProjectId
+      projectId: doc.projectId !== undefined ? (doc.projectId || null) : currentProjectId
     });
     while (!serverMode() && documents.length > 40) {
       var evict = documents.findIndex(function(x) { return !x.projectId; });
@@ -6325,7 +6487,23 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
     renderCustomProviders();
   }
 
-  function openKnowledgeModal() { renderKnowledgeList(); openModal('modal-knowledge'); }
+  // projectId：undefined ＝預設目前專案；'' ＝未分類；其他＝該專案（從資料夾的「+」開啟時）
+  function fillKnowledgeProjectSelect(projectId) {
+    var sel = document.getElementById('train-project');
+    if (!sel) return;
+    var want = projectId === undefined ? (currentProjectId || '') : (projectId || '');
+    sel.innerHTML = '<option value="">未分類</option>' + projects.filter(function(p) { return p && p.id; }).map(function(p) {
+      return '<option value="' + escapeHtml(p.id) + '">' + escapeHtml(p.name || '未命名專案') + '</option>';
+    }).join('');
+    sel.value = want;
+    if (sel.value !== want) sel.value = '';
+    sel.setAttribute('data-filled', '1');
+  }
+  function knowledgeProjectId() {
+    var sel = document.getElementById('train-project');
+    return sel && sel.getAttribute('data-filled') ? (sel.value || null) : currentProjectId;
+  }
+  function openKnowledgeModal(projectId) { fillKnowledgeProjectSelect(projectId); renderKnowledgeList(); openModal('modal-knowledge'); }
   function renderKnowledgeList() {
     var count = document.getElementById('knowledge-count');
     var box = document.getElementById('knowledge-list-box');
@@ -6333,10 +6511,14 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
     if (!box) return;
     renderServerFiles();
     if (!documents.length) { box.innerHTML = '<div class="empty-side">Sin documentos.</div>'; return; }
-    box.innerHTML = documents.map(function(item) {
-      return '<div style="background:var(--elev);border:1px solid var(--line);padding:6px 8px;border-radius:8px;display:flex;justify-content:space-between;gap:8px">' +
+    var row = function(item) {
+      return '<div style="background:var(--elev);border:1px solid var(--line);padding:6px 8px;border-radius:8px;display:flex;justify-content:space-between;gap:8px;margin-bottom:4px">' +
         '<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;font-size:0.75rem">' + (item.fileId ? '<span class="doc-file-tag">檔案</span>' : '') + escapeHtml(item.title) + '</div>' +
-        '<button data-del-doc="' + item.id + '" class="del-rag-item-btn mini-x" style="opacity:1" type="button">✕</button></div>';
+        '<button data-del-doc="' + escapeHtml(item.id) + '" class="del-rag-item-btn mini-x" style="opacity:1" type="button">✕</button></div>';
+    };
+    box.innerHTML = docFolders(documents).filter(function(g) { return g.docs.length; }).map(function(g) {
+      return '<div class="kb-group" data-kb-folder="' + escapeHtml(g.key) + '"><div class="kb-group-title">📁 ' + escapeHtml(g.name) + '（' + g.docs.length + '）</div>' +
+        g.docs.map(row).join('') + '</div>';
     }).join('');
   }
   function saveKnowledge() {
@@ -6345,7 +6527,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
     var title = titleEl ? titleEl.value.trim() : '';
     var content = contentEl ? contentEl.value.trim() : '';
     if (!content) return alert('Introduce contenido.');
-    addDocument({ title: title || 'Nota', content: content, type: 'note' });
+    addDocument({ title: title || 'Nota', content: content, type: 'note', projectId: knowledgeProjectId() });
     if (titleEl) titleEl.value = '';
     if (contentEl) contentEl.value = '';
     renderKnowledgeList();
@@ -6372,14 +6554,14 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
     if (serverFilesEnabled) {
       var picked = Array.prototype.slice.call(files);
       e.target.value = '';
-      await uploadFilesToServer(picked);
+      await uploadFilesToServer(picked, knowledgeProjectId());
       return;
     }
     for (var i = 0; i < files.length; i++) {
       var f = files[i];
       if (f.size > 200000) continue;
       var txt = await f.text();
-      addDocument({ title: f.name.replace(/\.[^/.]+$/, ''), content: txt.slice(0, 8000), type: 'upload' });
+      addDocument({ title: f.name.replace(/\.[^/.]+$/, ''), content: txt.slice(0, 8000), type: 'upload', projectId: knowledgeProjectId() });
     }
     e.target.value = '';
     renderKnowledgeList();

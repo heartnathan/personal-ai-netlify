@@ -206,15 +206,20 @@ Edge Functions（[limits](https://docs.netlify.com/build/edge-functions/limits/)
 
 - `src/mcp.js`：`settings.mcp.servers` = [{id, name, url, header_name, enabled, disabled_tools, tools(快取), tools_at, tools_error}]；Token 存 `secret.mcp.<id>`（AES-256-GCM）。Streamable HTTP 客戶端：每則 JSON-RPC 一次 POST、`Accept: application/json, text/event-stream`、JSON 或 SSE 回應皆可、`Mcp-Session-Id` 與 `MCP-Protocol-Version` 標頭、`redirect: manual`；每次操作重新 initialize（無狀態，適合 Functions／Edge）。
 - function 名稱 `<serverId>__<工具名>`（≤64 字元、只含英數 `_-`），`/api/mcp/call` 依名稱對回伺服器與工具，停用的伺服器或工具拒絕執行。
-- Edge `/api/chat` 以 `resolveTools` 注入 `tools`（`tool_choice: auto`），回應標頭 `X-Tool-Count`；前端累積 `delta.tool_calls`，顯示確認卡，允許後呼叫 `/api/tools/call`（舊 `/api/mcp/call` 保留），再以 `tool_turns`（assistant＋tool 訊息，接在 `normalizeRoles` 之後）重送 `/api/chat`，最多 5 回合。執行在 Function（60 秒上限），呼叫逾時 45 秒。
+- Edge `/api/chat` 以 `resolveTools` 注入 `tools`（`tool_choice: auto`），回應標頭 `X-Tool-Count`；前端累積 `delta.tool_calls`，顯示確認卡，允許後呼叫 `/api/tools/call`（舊 `/api/mcp/call` 保留），再以 `tool_turns`（assistant＋tool 訊息，接在 `normalizeRoles` 之後）重送 `/api/chat`，最多 8 回合（第 8 回合的後續請求改送 `use_tools:false`＋`tools_exhausted:true`，見 3.8.1）。執行在 Function（60 秒上限），呼叫逾時 45 秒。
 - 備份還原會略過 `secret.*` 設定。
 
 ## 3.8.1 文件工具（內建）
 
 - `src/doc_tools.js`：`docs__list`、`docs__search`（`hybridSearch`，失敗退回 `searchDocuments`）、`docs__read`（`offset`／`max_chars` ≤ 20,000，回 `total_length`、`next_offset`）、`docs__save`（無 id 用 `createEntity` 新增 `doc_type: note`；有 id 用 `updateEntity`，`mode` replace|append；兩者都會重切 `doc_chunks`）。專案參數接受 id 或名稱（完全相符，或唯一的部分相符），找不到回錯誤並列出現有專案。`file_id` 不為空的文件拒絕修改。輸入錯誤以 `is_error` 回給模型，讓它修正後重試。
+- `docs__list` 另回 `total`（符合條件的總數，超過 limit 時附 `hint`）、`projects[{id,name,documents}]`（每個專案的文件數）與 `unassigned`（未分類數）；文件只回 id／標題／專案／類型／字數／更新日期，不含內容預覽。
 - 注入：`resolveAllTools(db, resolveMcpTools)` 合併內建文件工具與 MCP 工具（任一來源失敗不影響另一個）；`settings.tools.docs` 為 false 時不含文件工具，`callDocTool` 也拒絕。`body.use_tools === false` 時全部不送。
-- 系統提示：`handleChat` 先決定 tools，再以伺服器設定的 `__toolNames`（前端送來的同名欄位會被刪除）加入誠實規則：有工具時「只有工具回傳成功才可說已儲存」；沒有 `docs__save` 時「你無法自行儲存文件，請使用者手動儲存」。規則併入唯一一則 system（`normalizeRoles`）。
+- 系統提示：`handleChat` 先決定 tools，再以伺服器設定的 `__toolNames`（前端送來的同名欄位會被刪除）加入規則（`toolRules`）：有工具時「只有工具回傳成功才可說已儲存」；有 `docs__*` 時加 `DOCS_ACCESS_RULE`（可存取文件、不要說無法存取、通常 1～3 次就夠、取得後立即回答、專案即資料夾、不要重複相同呼叫）；沒有 `docs__save` 時「你無法自行儲存文件，請使用者手動儲存」。規則併入唯一一則 system（`normalizeRoles`）。
+- 工具用完：`body.tools_exhausted === true` 時伺服器強制 `use_tools=false`，`toolRules` 改回 `TOOLS_EXHAUSTED_RULE`（「工具使用次數已用完，請只根據上面已取得的工具結果直接回答使用者」＋誠實規則）。
+- 沒有 tools 定義（`use_tools:false`、工具用完、或根本沒有工具）而請求帶 `tool_turns` 時，不送 assistant `tool_calls`／`tool` 角色訊息（部分供應商在沒有 tools 時拒收），改由 `toolTurnsText` 把每次呼叫（名稱、參數、結果，總長上限 60,000 字）轉成文字，放進唯一的 system；有 tools 時維持原生 OpenAI 格式（`toolTurnMessages`，最多 10 回合）。
+- 前端迴圈（`runToolLoop`）：`MAX_TOOL_ROUNDS = 8`；第 8 回合執行完後的請求帶 `use_tools:false`、`tools_exhausted:true`，回應即最終答案（即使模型仍吐出 tool_calls 也忽略）；空白時顯示「模型在工具使用次數用完後沒有給出回答」，請求本身失敗才走一般錯誤顯示。去重：`toolCallKey(name, arguments)`（參數 JSON 鍵排序正規化）記在單輪問答的 `seen`，唯讀文件工具成功過的相同呼叫直接回「（與先前相同的呼叫，結果同上，請直接使用先前結果）」不打 API；`docs__save` 同內容成功過也不再詢問、不重寫，拒絕過則回「使用者已拒絕過相同的呼叫」。MCP 工具不去重（副作用未知）。每次呼叫一行小字 `toolCallLabel`（列出文件／搜尋：…／讀取：標題／儲存：…）＋結果摘要。
 - 執行：前端統一呼叫 `POST /api/tools/call`（`/api/mcp/call` 保留相容）。`docs__list/search/read` 不顯示確認卡、直接執行，只留一行摘要；`docs__save` 顯示確認卡（動作、標題、專案、內容前 500 字），允許後執行，回傳的 `item` 直接寫入前端 documents 快取（同步雜湊一併更新，不會回寫），並觸發 `maybeBackfillEmbeddings`。工具結果上限 24,000 字（MCP 仍為 12,000），工具參數上限放寬到約 200,000 字以容納 `docs__save` 內容。
+- 測試：`test/doc-tools.test.mjs`（工具本身、注入、確認卡）與 `test/doc-tools-loop.test.mjs`（系統提示文字、`tools_exhausted` 轉文字且無 tool 角色、`docs__list` 專案文件數、前端 8 回合後強制回答與去重、`docs__save` 去重、文件頁資料夾分組）。
 
 ## 3.9 伺服器端保存回答
 
@@ -251,6 +256,7 @@ Edge Functions（[limits](https://docs.netlify.com/build/edge-functions/limits/)
 - 存檔：每次 `saveChats / saveDocuments / saveProjects / 儲存設定` 後 1.5 秒，只送雜湊有變的項目；失敗 15 秒後重試，資料仍留在本機。
 - 刪除：本機刪除 → 伺服器軟刪除；其他裝置刪除 → 下次同步時本機移除。
 - 首次使用：這個瀏覽器從未上傳過的對話、文件、專案、設定會自動上傳；`ta_providers_v1` 內的供應商（含 Key）上傳加密後**從瀏覽器刪除**。
+- 文件頁資料夾：`renderDocsList` 以 `docFolders(documents)` 依專案分組（專案清單順序，`未分類` 最後；專案不存在的文件也歸未分類），每組 `.doc-folder`（標題按鈕＋文件數、「+」新增、可折疊內容）。展開狀態存 `localStorage.ta_doc_folders`（key 為專案 id 或 `__none`；預設展開目前專案與未分類）。搜尋時只顯示有符合的資料夾並強制展開。「+」呼叫 `openKnowledgeModal(projectId)`，新增視窗的 `#train-project` 預設該專案，`saveKnowledge`／匯入改用所選專案（`addDocument` 接受 `projectId`，未給時沿用目前專案）。知識庫視窗的列表也依同樣分組顯示。專案頁的專案文件（`projectDocs`）不受影響。
 - 測試：`test/frontend.test.mjs` 用 jsdom 載入實際打包的 `app.js`，fetch 接到真的 router＋PGlite，驗證上述流程。
 
 ## 5. 空 API Key 與模型選單分組

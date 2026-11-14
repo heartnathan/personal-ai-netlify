@@ -40,7 +40,7 @@ export const DOC_TOOLS = [
     type: 'function',
     function: {
       name: 'docs__list',
-      description: '列出使用者知識庫裡的文件（id、標題、所屬專案、類型、字數、更新時間），並附上現有專案清單。' +
+      description: '列出使用者知識庫裡的文件（id、標題、所屬專案、類型、字數、更新日期），並附上專案（＝資料夾）清單與各專案文件數、未分類文件數。' +
         '使用者問「我有哪些文件／筆記」、要找某份文件但不知道 id、或要把內容存進某個專案前不確定專案名稱時使用。' +
         'query 只比對標題；要依內容找資料請用 docs__search。',
       parameters: {
@@ -93,7 +93,7 @@ export const DOC_TOOLS = [
       name: 'docs__save',
       description: '把內容存成使用者知識庫裡的文件：不帶 id ＝新增一份筆記；帶 id ＝修改該文件（mode=replace 取代全文，mode=append 接在文末）。' +
         '只在使用者明確要求儲存、記下、建立或修改文件時使用。每次執行前使用者都會看到確認卡，可能拒絕；' +
-        '只有本工具回傳成功後才能說已儲存。沒有資料夾功能，請用專案（project_id）分類。',
+        '只有本工具回傳成功後才能說已儲存。專案即資料夾：要放進某個資料夾就指定 project_id。',
       parameters: {
         type: 'object',
         properties: {
@@ -177,18 +177,28 @@ async function list(db, a, ownerId) {
   if (project) { params.push(project.id); where.push(`project_id = $${params.length}`) }
   const q = String(a.query || '').trim().slice(0, 200)
   if (q) { params.push(`%${q.replace(/[\\%_]/g, (c) => '\\' + c)}%`); where.push(`title ILIKE $${params.length}`) }
+  const total = Number((await db.query(`SELECT count(*)::int AS n FROM documents WHERE ${where.join(' AND ')}`, params))[0]?.n) || 0
   params.push(limit)
   const rows = await db.query(
     `SELECT id, title, project_id, doc_type, char_length(content) AS length, updated_at
        FROM documents WHERE ${where.join(' AND ')} ORDER BY updated_at DESC LIMIT $${params.length}`, params)
+  // 每個專案（＝資料夾）的文件數，讓模型一次掌握整體結構
+  const counts = await db.query(
+    `SELECT project_id, count(*)::int AS n FROM documents WHERE owner_id = $1 AND deleted_at IS NULL GROUP BY project_id`, [ownerId])
+  const countOf = Object.fromEntries(counts.map((r) => [r.project_id || '', Number(r.n) || 0]))
+  const day = (v) => (v instanceof Date ? v.toISOString() : String(v || '')).slice(0, 10)
   const documents = rows.map((r) => ({
     id: r.id, title: r.title || '（無標題）', project: r.project_id ? names[r.project_id] || r.project_id : null,
-    project_id: r.project_id || null, type: r.doc_type, chars: Number(r.length) || 0,
-    updated_at: r.updated_at instanceof Date ? r.updated_at.toISOString() : String(r.updated_at || ''),
+    project_id: r.project_id || null, type: r.doc_type, chars: Number(r.length) || 0, updated: day(r.updated_at),
   }))
   return {
-    content: out({ count: documents.length, documents, projects: projects.slice(0, MAX_LIST) }),
-    summary: project ? `已列出「${project.name}」的 ${documents.length} 份文件` : `已列出 ${documents.length} 份文件`,
+    content: out({
+      count: documents.length, total, ...(total > documents.length ? { hint: `只列出最近更新的 ${documents.length} 份；可用 project_id、query 或 limit 縮小範圍。` } : {}),
+      documents,
+      projects: projects.slice(0, MAX_LIST).map((p) => ({ id: p.id, name: p.name, documents: countOf[p.id] || 0 })),
+      unassigned: countOf[''] || 0,
+    }),
+    summary: project ? `已列出「${project.name}」的 ${documents.length} 份文件` : `已列出 ${documents.length} 份文件（共 ${total} 份）`,
   }
 }
 

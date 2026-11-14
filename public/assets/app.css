@@ -198,6 +198,21 @@
     .history-item:hover .history-del-btn, .doc-item:hover .mini-x, .proj-item:hover .mini-x { opacity: 1; }
     .history-del-btn:hover, .mini-x:hover { color: var(--red); }
     .empty-side { font-size: 0.75rem; color: var(--dim); padding: 10px 8px; }
+    /* 文件頁：依專案分組的可折疊資料夾 */
+    .doc-folder { display: flex; flex-direction: column; }
+    .doc-folder-row { display: flex; align-items: center; gap: 2px; }
+    .doc-folder-head { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; padding: 7px 8px; border: 0; background: transparent; color: var(--text); font-size: 0.8rem; font-weight: 600; text-align: left; cursor: pointer; border-radius: 8px; }
+    .doc-folder-head:hover { background: rgba(127,127,127,0.12); }
+    .doc-folder-caret { display: inline-block; width: 10px; color: var(--dim); transition: transform .12s; }
+    .doc-folder.open .doc-folder-caret { transform: rotate(90deg); }
+    .doc-folder-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .doc-folder-count { font-size: 0.68rem; color: var(--dim); font-weight: 500; }
+    .doc-folder-add { border: 0; background: transparent; color: var(--dim); cursor: pointer; padding: 2px 8px; border-radius: 6px; font-size: 0.9rem; }
+    .doc-folder-add:hover { color: var(--text); background: rgba(127,127,127,0.12); }
+    .doc-folder-body { display: none; flex-direction: column; gap: 2px; padding-left: 14px; }
+    .doc-folder.open .doc-folder-body { display: flex; }
+    .doc-folder-empty { font-size: 0.72rem; color: var(--dim); padding: 4px 10px; }
+    .kb-group-title { font-size: 0.7rem; color: var(--dim); font-weight: 600; margin: 8px 0 4px; }
     .sb-foot { padding: 10px 12px 14px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
     .sb-link {
       display: flex; align-items: center; gap: 8px; background: transparent; border: 0; color: var(--muted);
