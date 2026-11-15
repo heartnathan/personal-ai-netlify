@@ -2086,14 +2086,41 @@
     if (isNaN(d.getTime())) d = new Date();
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
+  // 合併串流中的 tool_calls 片段。
+  // 部分供應商（例如 Gemini 的 OpenAI 相容端點、部分 vLLM／代理）平行呼叫多個工具時全部用 index 0 或不給 index，
+  // 舊寫法會把名稱與參數接成一筆（web__searchweb__search…、{..}{..}），導致「找不到這個網路工具」。
+  // 規則：遇到不同的 id，或目前這筆參數已是完整 JSON 又來一個新名稱，就開新的一筆；重複送同一名稱不再串接。
+  function toolArgsComplete(s) {
+    s = String(s || '').trim();
+    if (!s) return false;
+    try { JSON.parse(s); return true; } catch(e) { return false; }
+  }
   function mergeToolCallDeltas(acc, deltas) {
+    if (!acc._map) { acc._map = {}; acc._last = -1; }
     deltas.forEach(function(d, k) {
-      var i = typeof d.index === 'number' ? d.index : k;
-      var c = acc[i] || (acc[i] = { id: '', name: '', arguments: '' });
+      if (!d) return;
+      var fn = d.function || {};
+      var key = typeof d.index === 'number' ? d.index : null;
+      var slot = key != null && acc._map[key] != null ? acc._map[key] : (key == null && acc._last >= 0 ? acc._last : -1);
+      var c = slot >= 0 ? acc[slot] : null;
+      var isNew = !c || (d.id && c.id
+        ? d.id !== c.id
+        : !!(fn.name && c.name && toolArgsComplete(c.arguments)));
+      if (isNew) {
+        slot = (key != null && acc._map[key] == null && !acc[key]) ? key : acc.length;
+        c = acc[slot] = { id: '', name: '', arguments: '' };
+      }
+      if (key != null) acc._map[key] = slot;
+      acc._last = slot;
       if (d.id) c.id = d.id;
-      if (d.function) {
-        if (d.function.name) c.name += d.function.name;
-        if (d.function.arguments) c.arguments += typeof d.function.arguments === 'string' ? d.function.arguments : JSON.stringify(d.function.arguments);
+      if (fn.name) {
+        if (!c.name) c.name = fn.name;
+        else if (c.name !== fn.name) c.name += fn.name;
+      }
+      if (fn.arguments) {
+        var a = typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments);
+        // 有些供應商每個片段都重送完整參數：已完整且內容相同就不再串接
+        if (!(toolArgsComplete(c.arguments) && c.arguments.trim() === a.trim())) c.arguments += a;
       }
     });
   }
