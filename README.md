@@ -14,7 +14,7 @@
 
 技術：Netlify Functions／Edge Functions＋Neon Postgres（pgvector）＋S3 相容物件儲存。由 [`scupro/personal-ai`](https://github.com/scupro/personal-ai)（Cloudflare Workers＋D1）移植而來。
 
-> **狀態**：已正式部署，含 MCP 工具、文件工具與伺服器端保存回答；81 項測試通過。
+> **狀態**：已正式部署，含 MCP 工具、文件工具、網路搜尋工具與伺服器端保存回答；92 項測試通過。
 > 尚未實測：真實 MCP 伺服器、Neon Object Storage、中文 BM25（lakebase）、Jina／Tavily 網頁搜尋、用戶端斷線後 Edge 背景保存回答。
 
 - 完整架構與設計理由：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
@@ -31,6 +31,7 @@
 | 供應商與模型 | **沒有內建供應商**。來源只有兩種：設定面板新增（Key 加密存資料庫）與 `PROVIDER_N_*` 環境變數（唯讀，Key 不進資料庫也不到瀏覽器）。任何 OpenAI 相容服務皆可，**允許空 API Key**（自架模型）；聊天模型與嵌入模型分開設定；模型選單**依供應商分組**；預設模型在面板選；可從供應商自動探索模型 |
 | 資料 | 個人資料、設定、介面偏好、對話、專案、Prompt、知識庫文件全部存 Neon |
 | 文件工具 | 內建 `docs__list`／`docs__search`／`docs__read`（免確認）與 `docs__save`（確認卡，按「允許」才寫入）；設定 → 供應商可關閉 |
+| 網路搜尋工具 | 內建 `web__search`（免確認）：有設定 Jina／Tavily 時模型可自行搜尋並附來源，與輸入框的搜尋開關無關；設定 → 供應商可關閉 |
 | 檔案 | 瀏覽器以 presigned URL 直傳物件儲存（不經 Function）；PDF（pdf.js）與 DOCX（mammoth）在瀏覽器端抽文字，伺服器切塊（約 1200 字、重疊 150）寫入知識庫 |
 | 檢索 | 關鍵字＋語意向量，以 RRF（k=60）合併；嵌入失敗自動退回關鍵字。關鍵字預設用 Neon 中文斷詞＋BM25（0004），未啟用、沒結果或出錯時退回二字組（英數詞＋中文二字組＋全文分數），可在面板切換 |
 | 語意嵌入 | **預設關閉**（只用關鍵字）；在面板選任一供應商的嵌入模型即開啟（例如 Cloudflare Workers AI `@cf/baai/bge-m3`、Cohere `embed-v5.0-pro`、OpenAI `text-embedding-3-small`） |
@@ -94,7 +95,7 @@ test/                                  node:test；資料庫測試以 PGlite 實
 | `/api/files`、`/:id/complete`、`/:id/download` | 上傳（presign）、完成、下載 |
 | `/api/memories`、`/api/memories/suggest` | 記憶、記憶建議 |
 | `/api/embeddings/status`、`/config`、`/backfill` | 嵌入狀態（含各供應商嵌入模型 `options`）、設定 `{provider_id, model}` 或 `{reset:true}` 關閉、補建向量 |
-| `/api/tools/call` | 統一工具呼叫：`docs__*` 走內建文件工具，其餘轉 MCP（前端只呼叫這支） |
+| `/api/tools/call` | 統一工具呼叫：`docs__*` 走內建文件工具、`web__*` 走內建網路搜尋，其餘轉 MCP（前端只呼叫這支） |
 | `/api/mcp/servers`、`/:id`、`/:id/refresh`、`/api/mcp/call` | MCP 伺服器清單／新增／修改（啟用、停用個別工具、換 Token）／刪除／重新取得工具；執行工具（前端在使用者允許後才呼叫） |
 | `/api/backup`、`/api/backup/restore` | 匯出、還原 |
 | `/api/admin/keys`、`/api/admin/rekey` | 金鑰狀態、重新加密 |
@@ -461,6 +462,26 @@ KEYWORD_SEARCH=bigram
 - 長度：結果數（1–5，預設 3）、每則字數（100–1200，預設 400）、總字數（300–6000，預設 1500）。Jina 以 `X-Respond-With: no-content` 只取摘要，不抓全文。
 - 查詢：取最後一則使用者訊息；寒暄或過短不搜尋，短追問會帶上前一則使用者訊息。回答下方只列出回答裡實際引用到網址或網域的來源。
 - 退路：面板沒有 Key 時用環境變數 `JINA_API_KEY`、`TAVILY_API_KEY`（需重新部署）。
+- 回答下方小字：開關開啟但搜尋沒有執行時會提示原因，例如「網路搜尋未執行：未設定搜尋 Key」「網路搜尋未執行：訊息太短或不需要搜尋」「網路搜尋失敗：逾時」。
+- 工具回合：模型呼叫工具（文件、網路、MCP）後的後續請求沿用首輪的開關值；首輪的搜尋結果由伺服器以 SSE 事件（`search_context`）交給前端，前端在後續回合原樣送回，伺服器**不再重新搜尋**（不重複計費），最終回答仍看得到首輪結果。
+- 「預設網路搜尋」（設定 → 一般）存在 `localStorage` 的 `ta_auto_search` 並同步到伺服器 `auto_search`；從另一台裝置同步下來時立即套用到輸入框開關，專案內對話走同一個送出流程。
+
+### 網路搜尋工具
+
+內建工具 `web__search`，讓聊天模型（含專案內對話）需要即時或網路資訊時**自己決定**搜尋，不需要 MCP。
+
+| | 輸入框「網路搜尋」開關 | `web__search` 工具 |
+|---|---|---|
+| 誰決定搜尋 | 你（每則訊息送出前，伺服器先搜一次） | 模型（需要時呼叫，可換關鍵字多搜幾次） |
+| 結果放哪裡 | 系統提示 | 工具結果（JSON：`title`、`url`、`snippet`） |
+| 何時可用 | 開關打開時 | 有搜尋服務（面板 Key 或環境變數）且 `tools.web` 未關閉時，**不論開關** |
+
+- 參數：`query`（必填）、`max_results`（選填，預設 5，上限＝面板的「結果數」）；摘要字數依面板「每則字數／總字數」截斷，工具結果最多 12,000 字。
+- 確認：唯讀，**免確認**；對話中只顯示一行小字「網路搜尋：關鍵字 → 找到 N 筆結果」。同一輪問答中相同參數的呼叫不重打 API。引用到的網址會列在回答下方的來源框。
+- 開關：設定 → 供應商 →「網路搜尋工具」勾選，對應 `settings` 的 `tools.web`（未設定＝開啟；`false`／`0`／`"off"` 關閉）。關閉後不提供給模型，`/api/tools/call` 也回 403。
+- 沒有搜尋服務時不提供給模型；直接呼叫 `/api/tools/call` 會回 400，訊息說明到「網頁搜尋」設定 Key。
+- 系統提示：有 `web__search` 時告訴模型「需要即時或網路資訊時用 web__search，回答附來源網址，不要說你無法上網」。同一則訊息已帶開關的預搜結果時，工具仍會提供，兩者不衝突。
+- 需求：聊天模型要支援 tool calling。
 
 ### `JINA_API_KEY`
 

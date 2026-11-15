@@ -1669,6 +1669,14 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
             <p class="settings-hint" style="margin:4px 0 0">開啟後，模型可自行列出、搜尋、讀取知識庫文件；新增或修改文件前會先顯示確認卡，你按「允許」才會儲存。</p>
             <p id="doc-tools-status" class="settings-hint" style="min-height:18px"></p>
           </div>
+          <div class="settings-card" id="web-tools-card" style="margin-top:14px">
+            <div class="form-label" style="margin-bottom:6px">網路搜尋工具</div>
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+              <input type="checkbox" id="web-tools-toggle"> 讓模型自行搜尋網路（web__search，免確認）
+            </label>
+            <p class="settings-hint" style="margin:4px 0 0">需先在「網頁搜尋」設定 Jina 或 Tavily 的 Key。開啟後，即使輸入框的「網路搜尋」沒開，模型需要即時資訊時也能自己搜尋並附上來源。</p>
+            <p id="web-tools-status" class="settings-hint" style="min-height:18px"></p>
+          </div>
         </div>
 
         <div id="pane-plan" class="settings-pane">
@@ -2315,6 +2323,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       // 1) 設定：伺服器有值 → 覆蓋本機；本機有、伺服器沒有 → 稍後推送
       var sres = await storeFetch('GET', '/api/settings');
       var serverSettings = sres.settings || {};
+      var autoBefore = localStorage.getItem('ta_auto_search');
       Object.keys(STORE_SETTINGS).forEach(function(lk) {
         var sk = STORE_SETTINGS[lk];
         if (!(sk in serverSettings)) return;
@@ -2327,6 +2336,13 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
         syncMeta.hashes['setting:' + sk] = storeHash(str);
       });
       selectedModel = localStorage.getItem('ta_model') || selectedModel;
+      // 「預設網路搜尋」由伺服器同步改變時（例如另一台裝置開啟），立即套用到輸入框開關，不必重新整理
+      if (localStorage.getItem('ta_auto_search') !== autoBefore) {
+        isWebSearch = localStorage.getItem('ta_auto_search') === '1';
+        var wsp = document.getElementById('web-search-pill');
+        if (wsp) wsp.classList.toggle('active', isWebSearch);
+        try { syncDockMenu(); } catch(eDock) {}
+      }
       // 2) 個人資料
       var pres = await storeFetch('GET', '/api/profile');
       if (pres.profile && Object.keys(pres.profile).length) {
@@ -2390,6 +2406,8 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
         serverChatIds[sc.id] = true;
         var ckey = 'chat:' + sc.id;
         var lc = chats[sc.id];
+        // 正在產生回答（含工具回合、確認卡）的對話不在此時覆蓋／重繪，避免畫面上的工具小字與確認卡被清掉；下次同步再對齊
+        if (isGenerating && sc.id === currentChatId) continue;
         if (lc && syncMeta.hashes[ckey] && syncMeta.hashes[ckey] !== storeHash(chatForHash(lc))) continue;
         if (lc && syncMeta.srv[ckey] === sc.updated_at) continue;
         var full = (await storeFetch('GET', '/api/conversations/' + encodeURIComponent(sc.id))).conversation;
@@ -2408,7 +2426,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       });
       if (touchedProjects) { saveProjects(); }
       if (touchedDocs) { saveDocuments(); }
-      if (touchedChats) { saveChats(); if (chats[currentChatId]) loadChatView(); }
+      if (touchedChats) { saveChats(); if (chats[currentChatId] && !isGenerating) loadChatView(); }
       if (touchedProjects || touchedDocs || touchedChats) renderSidebar();
       saveSyncMeta();
       setSyncStatus(imported ? ('正在把 ' + imported + ' 項本機資料上傳到伺服器…') : '已與伺服器同步', false);
@@ -3969,6 +3987,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
   }
   function toolLabel(name) {
     if (/^docs__/.test(String(name || ''))) return { server: '文件', tool: String(name).slice(6) };
+    if (/^web__/.test(String(name || ''))) return { server: '網路', tool: String(name).slice(5) };
     var m = String(name || '').match(/^(mcp[0-9a-f]+)__(.*)$/);
     if (!m) return { server: '', tool: name };
     var sv = null;
@@ -3976,7 +3995,8 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
     return { server: sv ? sv.name : 'MCP', tool: m[2] };
   }
   // 文件工具：docs__list / docs__search / docs__read 免確認；docs__save 一律顯示確認卡
-  var DOC_READ_TOOLS = { docs__list: 1, docs__search: 1, docs__read: 1 };
+  // 網路搜尋工具 web__search：唯讀、無副作用，同樣免確認並在同輪去重
+  var DOC_READ_TOOLS = { docs__list: 1, docs__search: 1, docs__read: 1, web__search: 1 };
   function isAutoTool(name) { return !!DOC_READ_TOOLS[name]; }
   function docSaveConfirmHtml(call) {
     var a = {};
@@ -4018,11 +4038,33 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
     try { renderSidebar(); } catch(e) {}
     try { maybeBackfillEmbeddings(); } catch(e) {}
   }
+  // 設定頁：網路搜尋工具開關（settings 的 tools.web，未設定＝開啟）；設定值由 loadDocToolsSetting 一起讀取（只打一次 /api/settings）
+  function bindWebToolsToggle(st) {
+    var cb = document.getElementById('web-tools-toggle');
+    var card = document.getElementById('web-tools-card');
+    if (!cb || !card) return;
+    card.style.display = serverMode() ? '' : 'none';
+    if (!serverMode()) return;
+    if (!cb._bound) {
+      cb._bound = true;
+      cb.addEventListener('change', async function() {
+        try {
+          await storeFetch('PUT', '/api/settings', { 'tools.web': !!cb.checked });
+          p5Status('web-tools-status', cb.checked ? '已開啟網路搜尋工具。' : '已關閉網路搜尋工具，模型將無法自行搜尋網路。', false);
+        } catch(e) { cb.checked = !cb.checked; p5Status('web-tools-status', '儲存失敗：' + (e.message || ''), true); }
+      });
+    }
+    if (st) {
+      var v = st['tools.web'];
+      cb.checked = !(v === false || v === 0 || v === '0' || String(v).toLowerCase() === 'false' || String(v).toLowerCase() === 'off');
+    }
+  }
   async function loadDocToolsSetting() {
     var cb = document.getElementById('doc-tools-toggle');
     var card = document.getElementById('doc-tools-card');
     if (!cb || !card) return;
     card.style.display = serverMode() ? '' : 'none';
+    bindWebToolsToggle(null);
     if (!serverMode()) return;
     if (!cb._bound) {
       cb._bound = true;
@@ -4037,7 +4079,8 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       var st = (await storeFetch('GET', '/api/settings')).settings || {};
       var v = st['tools.docs'];
       cb.checked = !(v === false || v === 0 || v === '0' || String(v).toLowerCase() === 'false' || String(v).toLowerCase() === 'off');
-    } catch(e) { p5Status('doc-tools-status', '讀取失敗：' + (e.message || ''), true); }
+      bindWebToolsToggle(st);
+    } catch(e) { p5Status('doc-tools-status', '讀取失敗：' + (e.message || ''), true); bindWebToolsToggle(null); }
   }
   function askToolPermission(container, call) {
     return new Promise(function(resolve) {
@@ -4101,6 +4144,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       return '讀取：' + short(title || a.id || '（未指定）') + (a.offset ? '（從第 ' + a.offset + ' 字）' : '');
     }
     if (name === 'docs__save') return (a.id ? '修改文件：' : '儲存：') + short(a.title || a.id || '');
+    if (name === 'web__search') return '網路搜尋：' + short(a.query || '（未指定）');
     var lb = toolLabel(name);
     return '工具：' + lb.tool + (lb.server ? '（' + lb.server + '）' : '');
   }
@@ -4132,7 +4176,32 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
     if (tc) tc.innerHTML = renderMarkdown(text);
     return { resp: resp, text: text, calls: calls.filter(Boolean) };
   }
-  async function runToolLoop(basePayload, firstText, firstCalls, contentCol, textContainer) {
+  function mergeSources(a, b) {
+    var out = (a || []).slice(), have = {};
+    out.forEach(function(s) { if (s && s.url) have[s.url] = 1; });
+    (b || []).forEach(function(s) { if (s && s.url && /^https?:\/\//i.test(s.url) && !have[s.url]) { have[s.url] = 1; out.push({ title: String(s.title || s.url), url: String(s.url) }); } });
+    return out;
+  }
+  // 網路搜尋未執行時的小字（X-Search-Status）
+  function searchStatusNote(status) {
+    var st = String(status || '');
+    if (!st || st === 'off' || st === 'ok' || st === 'cached' || st === 'reused') return '';
+    if (st === 'no_key') return '網路搜尋未執行：未設定搜尋 Key（設定 → 供應商 →「網頁搜尋」）';
+    if (st === 'skipped') return '網路搜尋未執行：訊息太短或不需要搜尋';
+    if (st === 'timeout') return '網路搜尋失敗：逾時';
+    var m = /^search_http_(\d+)$/.exec(st);
+    if (m) return '網路搜尋失敗：搜尋服務回應 HTTP ' + m[1] + (m[1] === '401' || m[1] === '403' ? '（Key 無效）' : (m[1] === '429' || m[1] === '402' || m[1] === '432' ? '（額度用完或過於頻繁）' : ''));
+    return '網路搜尋失敗：' + st;
+  }
+  function showSearchStatus(contentCol, status) {
+    var text = searchStatusNote(status);
+    if (!text || !contentCol) return;
+    var note = document.createElement('div');
+    note.className = 'msg-time search-status-note';
+    note.textContent = text;
+    contentCol.appendChild(note);
+  }
+  async function runToolLoop(basePayload, firstText, firstCalls, contentCol, textContainer, searchCtx) {
     var turns = [], roundMid = '';
     var seen = {}; // 同一輪問答的工具呼叫去重：key → 先前結果
     var text = firstText, calls = firstCalls, col = contentCol, tc = textContainer, resp = null, srcs = null;
@@ -4158,8 +4227,10 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
           try {
             var ra = await storeFetch('POST', '/api/tools/call', { name: c.name, arguments: c.arguments });
             results.push({ id: c.id, content: (ra.result.is_error ? '工具回報錯誤：' : '') + ra.result.content });
-            line.textContent = label + ' → ' + (ra.result.summary || (ra.result.is_error ? '文件工具回報錯誤。' : '完成'));
+            line.textContent = label + ' → ' + (ra.result.summary || (ra.result.is_error ? '工具回報錯誤。' : '完成'));
             if (!ra.result.is_error) seen[key] = 1;
+            // 網路搜尋結果的來源：併入回答下方的來源框（之後只顯示回答中實際引用的）
+            if (!ra.result.is_error && Array.isArray(ra.result.sources)) srcs = mergeSources(srcs, ra.result.sources);
           } catch(e) {
             results.push({ id: c.id, content: '工具執行失敗：' + (e.message || '') });
             line.textContent = label + ' → 執行失敗：' + (e.message || '');
@@ -4203,7 +4274,10 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       // 已用完回合：最後這次請求不送工具，伺服器把工具結果轉成文字並要求直接回答
       var lastRound = round >= MAX_TOOL_ROUNDS - 1;
       roundMid = newMid();
-      var payload2 = Object.assign({}, basePayload, { tool_turns: turns, search_web: false });
+      // 沿用首輪的 search_web；首輪搜尋結果（search_context）一起送回，伺服器不重新搜尋（不重複計費）
+      var payload2 = Object.assign({}, basePayload, { tool_turns: turns, search_web: !!basePayload.search_web });
+      if (basePayload.search_web && searchCtx && searchCtx.length) payload2.search_context = searchCtx;
+      else delete payload2.search_context;
       if (lastRound) { payload2.use_tools = false; payload2.tools_exhausted = true; }
       if (basePayload.persist) payload2.persist = Object.assign({}, basePayload.persist, { user: null, assistant_mid: roundMid });
       var dom = addMessageToDOM('ai', '');
@@ -4989,6 +5063,8 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       var decoder = new TextDecoder();
       var buffer = '';
       var srcHeader = response.headers.get('x-sources') || '';
+      var searchCtx = null; // 首輪網頁搜尋結果（伺服器以 SSE 事件送來），工具回合原樣回傳
+      var firstSearchStatus = response.headers.get('x-search-status') || '';
       if (srcHeader) {
         try { sources = JSON.parse(decodeURIComponent(srcHeader)) || []; } catch(eSrc) {}
       }
@@ -5006,6 +5082,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
           try {
             var p = JSON.parse(dataStr);
             if (p.sources) sources = p.sources;
+            if (Array.isArray(p.search_context)) searchCtx = p.search_context;
             if (p.profile) saveLocalProfile(p.profile);
             if (p.remembered && p.remembered.length) rememberedFacts = p.remembered;
             var delta = p.content;
@@ -5029,10 +5106,10 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       if (toolCalls.length) {
         // 工具：唯讀文件工具直接執行，其餘顯示確認卡；結果送回模型繼續回答（最多 8 回合，用完強制回答）
         if (fullText) { chats[currentChatId].messages.push({ role: 'ai', content: fullText, sources: [], at: Date.now(), mid: aiMid }); saveChats(); }
-        var loopOut = await runToolLoop(payload, fullText, toolCalls.filter(Boolean), contentCol, textContainer);
+        var loopOut = await runToolLoop(payload, fullText, toolCalls.filter(Boolean), contentCol, textContainer, searchCtx);
         fullText = loopOut.text; contentCol = loopOut.contentCol; textContainer = loopOut.textContainer; aiMid = loopOut.mid || aiMid;
         if (loopOut.response) response = loopOut.response;
-        if (loopOut.sources) sources = loopOut.sources;
+        if (loopOut.sources) sources = mergeSources(sources, loopOut.sources);
       }
       if (rememberedFacts.length && contentCol) {
         var memNote = document.createElement('div');
@@ -5053,6 +5130,7 @@ body:has(.art-panel.open) .tap-builder-pill { width: 32px; padding: 0; justify-c
       chats[currentChatId].messages.push({ role: 'ai', content: fullText, sources: sources, at: Date.now(), mid: aiMid });
       saveChats();
       showAppliedContext(contentCol, response);
+      if (payload.search_web) showSearchStatus(contentCol, firstSearchStatus);
       if (fullText) suggestMemories(contentCol, chats[currentChatId].messages.slice(), useServerProvider ? selectedProviderId : '', resolvedModel);
       if (window.TAP && fullText && promptText) { try { TAP.recordSent(promptText); } catch (eTap2) {} }
       var art = extractArtifact(fullText);

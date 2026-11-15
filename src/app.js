@@ -103,7 +103,7 @@ async function apiRoute(request, env, path, method) {
       resolveProvider: (body, e) => resolveChatProvider(getDb(e), body, e),
       loadContext: getDb(env) ? chatContextLoader(getDb(env)) : undefined,
       resolveSearch: getDb(env) ? (e) => resolveWebSearch(getDb(e), e) : undefined,
-      resolveTools: getDb(env) ? () => resolveAllTools(getDb(env), resolveMcpTools) : undefined,
+      resolveTools: getDb(env) ? (e) => resolveAllTools(getDb(env), resolveMcpTools, undefined, e || env) : undefined,
       saveReply: getDb(env) ? replySaver((input) => saveServerMessages(getDb(env), input)) : undefined,
     })
   }

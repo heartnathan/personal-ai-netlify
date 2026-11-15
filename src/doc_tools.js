@@ -8,12 +8,13 @@
 //
 // 開關：settings 的 tools.docs（未設定＝開啟；false / "false" / "0" / 0 ＝關閉）。
 // 關閉時不注入給模型，伺服器端呼叫也會拒絕。
-// 執行：前端呼叫 POST /api/tools/call {name, arguments}；docs__ 交給 callDocTool，其餘交給 MCP。
+// 執行：前端呼叫 POST /api/tools/call {name, arguments}；docs__ 交給 callDocTool，web__ 交給 callWebTool（src/web_tool.js），其餘交給 MCP。
 // 向量：寫入後 doc_chunks 會由 createEntity / updateEntity 重新切塊；語意向量沿用前端的
 //       maybeBackfillEmbeddings（/api/embeddings/backfill）補齊，與一般文件儲存流程相同。
 import { OWNER } from './repo/providers.js'
 import { createEntity, getEntity, getSettings, listEntities, searchDocuments, updateEntity } from './repo/entities.js'
 import { hybridSearch } from './embeddings.js'
+import { resolveWebTools } from './web_tool.js'
 
 export const DOC_TOOL_PREFIX = 'docs__'
 export const DOC_TOOL_SETTING = 'tools.docs'
@@ -114,13 +115,18 @@ export async function resolveDocTools(db, ownerId = OWNER) {
   return docToolsEnabled(await getSettings(db, ownerId)) ? DOC_TOOLS : []
 }
 
-/** 內建文件工具＋MCP 工具（聊天注入用）。任一來源失敗不影響另一個。 */
-export async function resolveAllTools(db, resolveMcp, ownerId = OWNER) {
+/**
+ * 內建文件工具＋內建網路搜尋工具（web__search）＋MCP 工具（聊天注入用）。任一來源失敗不影響其他來源。
+ * env：用來解析網路搜尋服務（面板 Key 或 JINA_API_KEY／TAVILY_API_KEY）；沒有搜尋服務時不含 web__search。
+ */
+export async function resolveAllTools(db, resolveMcp, ownerId = OWNER, env = {}) {
   let docs = []
+  let web = []
   let mcp = []
   try { docs = await resolveDocTools(db, ownerId) } catch (err) { console.error('doc tools load failed', err && err.message) }
+  try { web = await resolveWebTools(db, env || {}, ownerId) } catch (err) { console.error('web tools load failed', err && err.message) }
   try { mcp = resolveMcp ? (await resolveMcp(db, ownerId)) || [] : [] } catch (err) { console.error('mcp tools load failed', err && err.message) }
-  return [...docs, ...mcp]
+  return [...docs, ...web, ...mcp]
 }
 
 // ---- 共用 ----

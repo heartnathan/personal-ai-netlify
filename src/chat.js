@@ -50,6 +50,8 @@ export const DOCS_ACCESS_RULE = '你可以存取使用者的『文件』（知�
   '不要用相同參數重複呼叫同一個工具。'
 export const TOOLS_EXHAUSTED_RULE = '工具使用次數已用完，請只根據上面已取得的工具結果直接回答使用者，不要再嘗試呼叫工具；' +
   '若結果不足以完整回答，就說明已找到哪些內容、還缺什麼。'
+export const WEB_SEARCH_TOOL_RULE = '你可以用 web__search 搜尋網路：需要即時或網路上的資訊（新聞、價格、天氣、近期事件、你不確定或可能過時的事實）時，' +
+  '先呼叫 web__search 再回答，並在回答中附上引用的來源網址。不要說你無法上網或無法搜尋。'
 const HONESTY_RULE = '只有工具回傳成功的結果後，才可以說「已儲存」「已建立」「已修改」；' +
   '沒有對應的工具結果時，不得聲稱已存檔、已建立資料夾、已驗證或已執行任何動作。工具被使用者拒絕或回報錯誤時，要照實告知。'
 
@@ -64,6 +66,7 @@ export function toolRules(names, { exhausted = false } = {}) {
   } else {
     rules.push('你無法自行儲存或修改使用者的文件；使用者要求存檔時，請提供內容並告訴使用者手動儲存到知識庫。')
   }
+  if (list.includes('web__search')) rules.push(WEB_SEARCH_TOOL_RULE)
   return rules.join('')
 }
 
@@ -331,6 +334,37 @@ async function upstreamErrorDetail(upstream) {
   } catch { return '' }
 }
 
+/** 前端回傳的首輪搜尋結果（工具回合用）：只留 http(s) 網址、截斷長度，再套用最大上限。 */
+export function reusedSearchResults(list) {
+  if (!Array.isArray(list)) return []
+  const clean = []
+  for (const r of list.slice(0, 50)) {
+    if (clean.length >= 5) break
+    if (!r || typeof r !== 'object') continue
+    const url = String(r.url || '').trim().slice(0, 2000)
+    if (!/^https?:\/\//i.test(url)) continue
+    clean.push({ title: String(r.title || url).replace(/\s+/g, ' ').trim().slice(0, 180), url, content: String(r.content || '').slice(0, 1200) })
+  }
+  return limitSearchResults(clean, { SEARCH_MAX_RESULTS: 5, SEARCH_SNIPPET_CHARS: 1200, SEARCH_CONTEXT_CHARS: 6000 })
+}
+
+/** 首輪有搜尋結果時，在 SSE 最前面加一個 {search_context} 事件，讓前端在工具回合回傳（不重查）。 */
+function withSearchContext(stream, results, toolRound) {
+  if (toolRound || !results || !results.length || !stream) return stream
+  const head = new TextEncoder().encode(`data: ${JSON.stringify({ search_context: results.map((r) => ({ title: r.title, url: r.url, content: r.content })) })}\n\n`)
+  const reader = stream.getReader()
+  let sent = false
+  return new ReadableStream({
+    async pull(controller) {
+      if (!sent) { sent = true; controller.enqueue(head); return }
+      const { value, done } = await reader.read()
+      if (done) controller.close()
+      else controller.enqueue(value)
+    },
+    cancel(reason) { try { reader.cancel(reason) } catch {} },
+  })
+}
+
 export async function handleChat(request, env, { resolveProvider, loadContext, resolveSearch, resolveTools, saveReply, waitUntil } = {}) {
   let body
   try {
@@ -352,20 +386,30 @@ export async function handleChat(request, env, { resolveProvider, loadContext, r
 
   let searchResults = []
   let searchStatus = ''
-  const searchQuery = body.search_web ? buildSearchQuery(body) : ''
-  if (body.search_web && !searchQuery) searchStatus = 'skipped'
-  if (searchQuery) {
-    const query = searchQuery
-    let cfg = null
-    try { cfg = resolveSearch ? await resolveSearch(env) : null } catch {}
-    const limits = (cfg && cfg.limits) || searchLimits(env)
-    const found = cfg && !cfg.provider
-      ? { results: [], error: 'no_key' }
-      : await searchWeb(query, env, { maxResults: limits.maxResults, provider: cfg?.provider, apiKey: cfg?.apiKey })
-    searchResults = limitSearchResults(found.results || [], {
-      SEARCH_MAX_RESULTS: limits.maxResults, SEARCH_SNIPPET_CHARS: limits.snippetChars, SEARCH_CONTEXT_CHARS: limits.contextChars,
-    })
-    searchStatus = found.error || (found.cached ? 'cached' : 'ok')
+  // 工具回合（帶 tool_turns 的後續請求）不重新搜尋：沿用前端回傳的首輪結果 search_context，
+  // 避免同一則提問在每個工具回合重複計費（Edge 的記憶體快取每個 isolate 各自獨立、隨時可能被回收，不可靠）。
+  const toolRound = Array.isArray(body.tool_turns) && body.tool_turns.length > 0
+  if (toolRound) {
+    if (body.search_web) {
+      searchResults = reusedSearchResults(body.search_context)
+      searchStatus = searchResults.length ? 'reused' : 'skipped'
+    }
+  } else {
+    const searchQuery = body.search_web ? buildSearchQuery(body) : ''
+    if (body.search_web && !searchQuery) searchStatus = 'skipped'
+    if (searchQuery) {
+      const query = searchQuery
+      let cfg = null
+      try { cfg = resolveSearch ? await resolveSearch(env) : null } catch {}
+      const limits = (cfg && cfg.limits) || searchLimits(env)
+      const found = cfg && !cfg.provider
+        ? { results: [], error: 'no_key' }
+        : await searchWeb(query, env, { maxResults: limits.maxResults, provider: cfg?.provider, apiKey: cfg?.apiKey })
+      searchResults = limitSearchResults(found.results || [], {
+        SEARCH_MAX_RESULTS: limits.maxResults, SEARCH_SNIPPET_CHARS: limits.snippetChars, SEARCH_CONTEXT_CHARS: limits.contextChars,
+      })
+      searchStatus = found.error || (found.cached ? 'cached' : 'ok')
+    }
   }
 
   delete body.__serverContext
@@ -472,7 +516,8 @@ export async function handleChat(request, env, { resolveProvider, loadContext, r
     try {
       const data = await upstream.json()
       const response = sseFromJson(data)
-      const copy = new Response(persist ? persistStream(response.body, persist, sources, { saveReply, waitUntil }) : response.body, response)
+      const jsonBody = withSearchContext(response.body, searchResults, toolRound)
+      const copy = new Response(persist ? persistStream(jsonBody, persist, sources, { saveReply, waitUntil }) : jsonBody, response)
       for (const [k, v] of Object.entries(headers)) copy.headers.set(k, v)
       return copy
     } catch {
@@ -485,7 +530,7 @@ export async function handleChat(request, env, { resolveProvider, loadContext, r
     upstreamBody.max_tokens = Math.min(chatMaxTokensCap(env), upstreamBody.max_tokens * 4)
     return callUpstream()
   }
-  const body0 = budgetRetryStream(upstream.body, { canGrow, refetch, budget: () => upstreamBody.max_tokens })
+  const body0 = withSearchContext(budgetRetryStream(upstream.body, { canGrow, refetch, budget: () => upstreamBody.max_tokens }), searchResults, toolRound)
   return new Response(persist ? persistStream(body0, persist, sources, { saveReply, waitUntil }) : body0, { headers })
 }
 

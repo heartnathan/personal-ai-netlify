@@ -19,7 +19,7 @@
 //   DELETE /api/files/:id
 //   GET    /api/mcp/servers             POST /api/mcp/servers {name,url,token?,header_name?}  PATCH|DELETE /api/mcp/servers/:id  POST /api/mcp/servers/:id/refresh
 //   POST   /api/mcp/call                {name, arguments}（前端使用者允許後才呼叫）
-//   POST   /api/tools/call              {name, arguments}：docs__* 內建文件工具，其餘轉 MCP（前端統一呼叫）
+//   POST   /api/tools/call              {name, arguments}：docs__* 內建文件工具、web__* 內建網路搜尋，其餘轉 MCP（前端統一呼叫）
 //   GET    /api/search/web              PUT /api/search/web {provider:'jina'|'tavily'|'off', api_key, key_provider, maxResults, snippetChars, contextChars}
 //   GET    /api/search/status           PUT /api/search/config {keyword: 'auto'|'bm25'|'bigram'|null}（關鍵字引擎）
 //   GET    /api/embeddings/status       PUT /api/embeddings/config {provider_id, model} | {reset:true}（關閉）   POST /api/embeddings/backfill
@@ -47,6 +47,7 @@ import { handleMemorySuggest } from './memory_suggest.js'
 import { backfillEmbeddings, embeddingStatus, hybridSearch, setEmbeddingConfig } from './embeddings.js'
 import { keywordStatus, setKeywordMode } from './keyword_search.js'
 import { callDocTool, isDocTool } from './doc_tools.js'
+import { callWebTool, isWebTool } from './web_tool.js'
 import { callMcpTool, createMcpServer, deleteMcpServer, listMcpServers, refreshMcpServer, rekeyMcpSecrets, updateMcpServer } from './mcp.js'
 import { rekeyWebSearchSecrets, setWebSearchConfig, webSearchStatus } from './web_search_config.js'
 import { BACKUP_FORMAT, BACKUP_VERSION, TABLE_ORDER, exportPage, restoreRows } from './backup.js'
@@ -142,10 +143,13 @@ const ROUTES = [
   ['POST', new RegExp(`^/api/mcp/servers/${ID}/refresh$`), async ({ db, env, m }) => mcpOut(async () => ({ server: await refreshMcpServer(db, env, m[1]) }))],
   ['DELETE', new RegExp(`^/api/mcp/servers/${ID}$`), async ({ db, m }) => ok(await deleteMcpServer(db, m[1]))],
   ['POST', /^\/api\/mcp\/call$/, async ({ db, env, body }) => mcpOut(async () => ({ result: await callMcpTool(db, env, body || {}) }))],
-  // 統一工具呼叫：docs__ 開頭＝內建文件工具（寫入類由前端先取得使用者允許），其餘＝MCP
-  ['POST', /^\/api\/tools\/call$/, async ({ db, env, body }) => mcpOut(async () => ({
-    result: isDocTool(body && body.name) ? await callDocTool(db, env, body || {}) : await callMcpTool(db, env, body || {}),
-  }))],
+  // 統一工具呼叫：docs__ 開頭＝內建文件工具（寫入類由前端先取得使用者允許），web__＝內建網路搜尋（唯讀），其餘＝MCP
+  ['POST', /^\/api\/tools\/call$/, async ({ db, env, body }) => mcpOut(async () => {
+    const name = body && body.name
+    if (isDocTool(name)) return { result: await callDocTool(db, env, body || {}) }
+    if (isWebTool(name)) return { result: await callWebTool(db, env, body || {}) }
+    return { result: await callMcpTool(db, env, body || {}) }
+  })],
   // 網頁搜尋供應商（面板：Jina / Tavily，Key 加密存 Neon）
   ['GET', /^\/api\/search\/web$/, async ({ db, env }) => json({ ok: true, status: await webSearchStatus(db, env) })],
   ['PUT', /^\/api\/search\/web$/, async ({ db, env, body }) => {

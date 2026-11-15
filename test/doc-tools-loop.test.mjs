@@ -172,7 +172,7 @@ async function boot(db, upstreamFn) {
   w.document.dispatchEvent(new w.Event('DOMContentLoaded'))
   w.dispatchEvent(new w.Event('load'))
   await waitFor(() => w.document.querySelector(`[data-model="${pid}|m1"]`))
-  const close = () => { globalThis.fetch = originalFetch; w.close() }
+  const close = async () => { await sleep(500); globalThis.fetch = originalFetch; w.close() } // 先讓背景同步結束再關閉視窗
   return { w, pid, upstream, calls, chatBodies, close, $: (id) => w.document.getElementById(id) }
 }
 
@@ -226,7 +226,7 @@ test('frontend: repeated identical read calls are deduped; after 8 rounds a fina
     // 不再出現死路訊息
     assert.doesNotMatch(env.w.document.body.textContent, /已達工具呼叫上限/)
     await waitFor(() => /貓叫小花。/.test(env.w.localStorage.getItem('ta_ai_chats') || ''))
-  } finally { env.close() }
+  } finally { await env.close() }
 })
 
 test('frontend: list/read labels; duplicate docs__save is not executed twice and asks only once', async () => {
@@ -254,7 +254,7 @@ test('frontend: list/read labels; duplicate docs__save is not executed twice and
     assert.match(lines[2], /^儲存：清單 → 重複呼叫，未再執行/)
     const lastTool = env.upstream[4].messages.filter((m) => m.role === 'tool').pop()
     assert.equal(lastTool.content, '（與先前相同的呼叫，結果同上，請直接使用先前結果）')
-  } finally { env.close() }
+  } finally { await env.close() }
 })
 
 test('frontend: documents page groups documents into collapsible project folders', async () => {
@@ -318,5 +318,5 @@ test('frontend: documents page groups documents into collapsible project folders
     assert.deepEqual(groups.slice(0, 2).sort(), ['📁 京都旅行（2）', '📁 工作（2）'].sort())
     // 伺服器同步後寫入正確的 project_id
     await waitFor(async () => (await db.query(`SELECT project_id FROM documents WHERE title = '新筆記'`))[0]?.project_id === 'p2', 20000)
-  } finally { env.close() }
+  } finally { await env.close() }
 })

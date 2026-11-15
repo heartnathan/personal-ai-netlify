@@ -295,6 +295,7 @@ test('frontend: read-only doc tools run without a card, docs__save asks first an
     assert.match(toolResults[0], /d1/)
     assert.match(toolResults[1], /"action": "created"/)
   } finally {
+    await sleep(500) // 讓背景同步／載入在關閉視窗前結束，避免測試結束後的非同步錯誤
     globalThis.fetch = originalFetch
     w.close()
   }

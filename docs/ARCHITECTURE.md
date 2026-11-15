@@ -227,6 +227,17 @@ Edge Functions（[limits](https://docs.netlify.com/build/edge-functions/limits/)
 - 推理用光額度：HTTP 錯誤（`isOutputBudgetError`）或串流中在任何 content／tool_calls 之前出現同類錯誤或 `finish_reason: length`，由 `budgetRetryStream` 放大 4 倍重送一次並接續新串流；仍失敗回 `output_budget_exhausted` 中文錯誤。已輸出內容後不重試。
 - Edge 串流無 60 秒函式限制，但上限越大回答可能越久。
 
+## 3.8.3 網路搜尋工具（內建）
+
+- `src/web_tool.js`：`web__search`（`query` 必填、`max_results` 選填，預設 5、上限＝`resolveWebSearch` 的 `limits.maxResults`）。前綴 `web__` 不與 MCP（`mcp<hex>__`）或 `docs__` 衝突。執行用 `src/tools/search.js` 的 `searchWeb`（provider／apiKey 由 `resolveWebSearch` 給）＋`limitSearchResults`（面板的 snippetChars／contextChars），回 JSON `{query, provider, count, results[{title,url,snippet}], hint}`，整體上限 12,000 字；另回 `sources[{title,url}]` 給前端來源框。搜尋服務錯誤（HTTP 401/403/429、逾時、連線失敗）以 `is_error` 回給模型。
+- 注入：`resolveAllTools(db, resolveMcp, ownerId, env)` → 文件工具、`resolveWebTools`、MCP（任一失敗不影響其他）。只有 `settings.tools.web` 未關閉（比照 `docToolsEnabled`）且 `resolveWebSearch` 回傳 provider（jina/tavily）時才含 `web__search`；與 `search_web` 無關。`src/app.js` 與 `netlify/edge-functions/chat.js` 的 `resolveTools` 傳入 env。
+- 呼叫：`POST /api/tools/call` 依前綴分派：`docs__`→`callDocTool`、`web__`→`callWebTool`、其餘→MCP。`tools.web` 關閉 403；沒有搜尋服務 400（訊息指向「網頁搜尋」設定）；未知 `web__` 名稱 404。
+- 系統提示：`toolRules` 在名稱含 `web__search` 時加 `WEB_SEARCH_TOOL_RULE`（需要即時或網路資訊時用 web__search、附來源網址、不要說無法上網）。
+- 前端：`DOC_READ_TOOLS` 含 `web__search` → `isAutoTool` 為真（免確認、`seen` 去重）；`toolLabel` 伺服器名稱「網路」；`toolCallLabel` 小字「網路搜尋：<query>」；結果的 `sources` 以 `mergeSources` 併入來源框（再經 `citedSources` 只留回答中引用的）。設定頁「網路搜尋工具」勾選（`web-tools-toggle`，與文件工具共用一次 `/api/settings` 讀取）。
+- 預搜與工具回合：首輪 `search_web` 的結果在 SSE 最前面以 `{search_context:[{title,url,content}]}` 事件送給前端（`withSearchContext`）；`runToolLoop` 的後續請求沿用首輪 `search_web`，並帶回 `search_context`。伺服器在帶 `tool_turns` 的請求一律不呼叫 `searchWeb`，改用 `reusedSearchResults`（只留 http(s) 網址、截斷、最多 5 筆）注入，`X-Search-Status: reused`（沒帶結果時 `skipped`）。理由：`src/tools/search.js` 的記憶體快取在 Edge 上每個 isolate 各自獨立、可能隨時回收，不能保證避免重複計費。
+- 前端提示：首輪 `X-Search-Status` 為 `no_key`／`skipped`／`timeout`／`search_http_*` 等時，回答下方加一行 `.search-status-note` 小字。設定同步改變 `ta_auto_search` 時立即更新 `isWebSearch`。同步時跳過正在產生回答的目前對話（不覆蓋、不重繪），避免工具小字與確認卡被清掉。
+- 測試：`test/web-tool.test.mjs`（注入條件、Jina／Tavily 模擬回應與上限、錯誤、路由 403/400、系統提示、工具回合不重查、前端免確認／去重／小字／來源、search_web 沿用、未設定 Key 的提示）。
+
 ## 3.9 伺服器端保存回答
 
 - 前端每則訊息有 `mid`；`/api/chat` 帶 `persist {conversation_id, title, project_id, user{mid,content,at}, assistant_mid}`。
