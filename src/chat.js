@@ -296,6 +296,41 @@ function persistStream(stream, persist, sources, { saveReply, waitUntil }) {
   return toClient
 }
 
+// ── 輸出上限 ─────────────────────────────────────────
+// CHAT_MAX_TOKENS：每次回答的預設輸出上限（預設 8192）；CHAT_MAX_TOKENS_CAP：硬上限（預設 32768，最多 131072）。
+export function chatMaxTokensCap(env = {}) {
+  const n = Number(env && env.CHAT_MAX_TOKENS_CAP)
+  return Number.isFinite(n) && n >= 256 ? Math.min(131072, Math.floor(n)) : 32768
+}
+
+export function chatMaxTokens(body = {}, env = {}) {
+  const cap = chatMaxTokensCap(env)
+  const envDefault = Number(env && env.CHAT_MAX_TOKENS)
+  const fallback = Number.isFinite(envDefault) && envDefault >= 256 ? envDefault : 8192
+  const asked = Number(body && body.max_tokens)
+  const value = Number.isFinite(asked) && asked > 0 ? asked : fallback
+  return Math.floor(Math.min(cap, Math.max(256, value)))
+}
+
+export function isOutputBudgetError(detail) {
+  const t = String(detail || '').toLowerCase()
+  return /output budget|reasoning (budget|tokens?)|max_(completion_)?tokens|max tokens|length limit/.test(t) && /reason|budget|token|length/.test(t)
+}
+
+async function upstreamErrorDetail(upstream) {
+  try {
+    const text = await upstream.text()
+    if (text.length >= 2000) return ''
+    try {
+      const parsed = JSON.parse(text)
+      const d = parsed?.error?.message || parsed?.message || parsed?.error || ''
+      return typeof d === 'string' ? d : JSON.stringify(d).slice(0, 300)
+    } catch {
+      return text.slice(0, 300)
+    }
+  } catch { return '' }
+}
+
 export async function handleChat(request, env, { resolveProvider, loadContext, resolveSearch, resolveTools, saveReply, waitUntil } = {}) {
   let body
   try {
@@ -369,45 +404,52 @@ export async function handleChat(request, env, { resolveProvider, loadContext, r
     messages,
     stream: true,
     temperature: Math.min(2, Math.max(0, Number(body.temperature ?? 0.7))),
-    max_tokens: Math.min(8192, Math.max(256, Number(body.max_tokens ?? 2048))),
+    max_tokens: chatMaxTokens(body, env),
   }
+  const effort = String((env && env.CHAT_REASONING_EFFORT) || '').trim().toLowerCase()
+  if (['low', 'medium', 'high'].includes(effort)) upstreamBody.reasoning_effort = effort
 
   const persist = saveReply ? cleanPersist(body.persist) : null
 
   if (tools.length) { upstreamBody.tools = tools; upstreamBody.tool_choice = 'auto' }
   const toolCount = tools.length
 
+  const callUpstream = () => fetchWithTimeout(
+    chatCompletionsUrl(provider.baseUrl),
+    {
+      method: 'POST',
+      headers: upstreamHeaders(provider.apiKey),
+      body: JSON.stringify(upstreamBody),
+      // 伺服器端保存時不跟著瀏覽器中斷（關頁後仍收完並寫入）；否則瀏覽器停止就中止上游
+      signal: persist ? undefined : request.signal,
+    },
+    120_000,
+  )
+
   let upstream
-  try {
-    upstream = await fetchWithTimeout(
-      chatCompletionsUrl(provider.baseUrl),
-      {
-        method: 'POST',
-        headers: upstreamHeaders(provider.apiKey),
-        body: JSON.stringify(upstreamBody),
-        // 伺服器端保存時不跟著瀏覽器中斷（關頁後仍收完並寫入）；否則瀏覽器停止就中止上游
-        signal: persist ? undefined : request.signal,
-      },
-      120_000,
-    )
-  } catch (err) {
-    const timedOut = err && (err.name === 'AbortError' || String(err.message || '').includes('timeout'))
-    return errorJson(timedOut ? '供應商連線逾時' : '無法連線到供應商', 502, 'provider_unreachable')
+  let detail = ''
+  // 推理型模型可能把輸出額度全花在思考：供應商回報後，把上限放大 4 倍（不超過 CHAT_MAX_TOKENS_CAP）重試一次
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      upstream = await callUpstream()
+    } catch (err) {
+      const timedOut = err && (err.name === 'AbortError' || String(err.message || '').includes('timeout'))
+      return errorJson(timedOut ? '供應商連線逾時' : '無法連線到供應商', 502, 'provider_unreachable')
+    }
+    if (upstream.ok) break
+    detail = await upstreamErrorDetail(upstream)
+    const cap = chatMaxTokensCap(env)
+    if (attempt === 0 && isOutputBudgetError(detail) && upstreamBody.max_tokens < cap) {
+      upstreamBody.max_tokens = Math.min(cap, upstreamBody.max_tokens * 4)
+      continue
+    }
+    break
   }
 
   if (!upstream.ok) {
-    let detail = ''
-    try {
-      const text = await upstream.text()
-      if (text.length < 2000) {
-        try {
-          const parsed = JSON.parse(text)
-          detail = parsed?.error?.message || parsed?.message || parsed?.error || ''
-        } catch {
-          detail = text.slice(0, 300)
-        }
-      }
-    } catch {}
+    if (isOutputBudgetError(detail)) {
+      return errorJson(`模型把輸出額度（${upstreamBody.max_tokens} tokens）都用在推理，沒有產生回答。可提高 CHAT_MAX_TOKENS，或設定 CHAT_REASONING_EFFORT=low，或縮短問題後再試。（供應商：${String(detail).slice(0, 200)}）`, 502, 'output_budget_exhausted')
+    }
     return providerError(upstream.status, String(detail || '').slice(0, 500))
   }
 
@@ -438,7 +480,94 @@ export async function handleChat(request, env, { resolveProvider, loadContext, r
     }
   }
 
-  return new Response(persist ? persistStream(upstream.body, persist, sources, { saveReply, waitUntil }) : upstream.body, { headers })
+  const canGrow = () => upstreamBody.max_tokens < chatMaxTokensCap(env)
+  const refetch = async () => {
+    upstreamBody.max_tokens = Math.min(chatMaxTokensCap(env), upstreamBody.max_tokens * 4)
+    return callUpstream()
+  }
+  const body0 = budgetRetryStream(upstream.body, { canGrow, refetch, budget: () => upstreamBody.max_tokens })
+  return new Response(persist ? persistStream(body0, persist, sources, { saveReply, waitUntil }) : body0, { headers })
+}
+
+function budgetMessage(tokens, detail) {
+  return `模型把輸出額度（${tokens} tokens）都用在推理，沒有產生回答。可提高 CHAT_MAX_TOKENS，或設定 CHAT_REASONING_EFFORT=low，或縮短問題後再試。${detail ? `（供應商：${String(detail).slice(0, 200)}）` : ''}`
+}
+
+/**
+ * 串流中途若供應商回報「輸出額度用在推理」（或尚未輸出任何內容就 finish_reason=length），
+ * 且還沒送出任何回答內容，就放大上限重新請求一次，接續新的串流；第二次仍失敗則改成清楚的中文錯誤。
+ */
+export function budgetRetryStream(stream, { canGrow, refetch, budget }) {
+  const enc = new TextEncoder()
+  const dec = new TextDecoder()
+  let reader = stream.getReader()
+  let buffer = ''
+  let emitted = false
+  let retried = false
+  let finished = false
+  const sse = (obj) => enc.encode(`data: ${JSON.stringify(obj)}\n\n`)
+  return new ReadableStream({
+    async pull(controller) {
+      if (finished) return
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) {
+          if (buffer) controller.enqueue(enc.encode(buffer))
+          buffer = ''
+          finished = true
+          controller.close()
+          return
+        }
+        buffer += dec.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop()
+        let out = ''
+        let switched = false
+        for (const line of lines) {
+          const t = line.trim()
+          if (t.startsWith('data:') && t !== 'data: [DONE]') {
+            let p = null
+            try { p = JSON.parse(t.slice(5).trim()) } catch {}
+            if (p) {
+              const errMsg = p.error ? (typeof p.error === 'string' ? p.error : p.error.message || '') : ''
+              const choice = p.choices && p.choices[0]
+              const delta = (choice && choice.delta) || {}
+              const emptyLength = choice && choice.finish_reason === 'length' && !emitted && !delta.content
+              const budgetHit = (errMsg && isOutputBudgetError(errMsg)) || emptyLength
+              if (budgetHit && !emitted) {
+                if (!retried && canGrow()) {
+                  retried = true
+                  try { await reader.cancel() } catch {}
+                  let next
+                  try { next = await refetch() } catch { next = null }
+                  if (next && next.ok && next.body) {
+                    reader = next.body.getReader()
+                    buffer = ''
+                    switched = true
+                    break
+                  }
+                  const d = next ? await upstreamErrorDetail(next) : ''
+                  if (out) controller.enqueue(enc.encode(out))
+                  controller.enqueue(sse({ error: { message: budgetMessage(budget(), d || errMsg) } }))
+                  controller.enqueue(enc.encode('data: [DONE]\n\n'))
+                  finished = true
+                  controller.close()
+                  return
+                }
+                out += `data: ${JSON.stringify({ error: { message: budgetMessage(budget(), errMsg) } })}\n`
+                continue
+              }
+              if (delta.content || delta.tool_calls) emitted = true
+            }
+          }
+          out += line + '\n'
+        }
+        if (switched) { if (out) { controller.enqueue(enc.encode(out)); return } continue }
+        if (out) { controller.enqueue(enc.encode(out)); return }
+      }
+    },
+    cancel(reason) { try { reader.cancel(reason) } catch {} },
+  })
 }
 
 /** 保存一則串流回答（與使用者訊息）；回答為空（例如只有工具呼叫）時只存使用者訊息。 */

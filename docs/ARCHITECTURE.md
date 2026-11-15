@@ -221,6 +221,12 @@ Edge Functions（[limits](https://docs.netlify.com/build/edge-functions/limits/)
 - 執行：前端統一呼叫 `POST /api/tools/call`（`/api/mcp/call` 保留相容）。`docs__list/search/read` 不顯示確認卡、直接執行，只留一行摘要；`docs__save` 顯示確認卡（動作、標題、專案、內容前 500 字），允許後執行，回傳的 `item` 直接寫入前端 documents 快取（同步雜湊一併更新，不會回寫），並觸發 `maybeBackfillEmbeddings`。工具結果上限 24,000 字（MCP 仍為 12,000），工具參數上限放寬到約 200,000 字以容納 `docs__save` 內容。
 - 測試：`test/doc-tools.test.mjs`（工具本身、注入、確認卡）與 `test/doc-tools-loop.test.mjs`（系統提示文字、`tools_exhausted` 轉文字且無 tool 角色、`docs__list` 專案文件數、前端 8 回合後強制回答與去重、`docs__save` 去重、文件頁資料夾分組）。
 
+## 3.8.2 輸出上限與推理額度
+
+- `max_tokens` 預設 `CHAT_MAX_TOKENS`（8192），上限 `CHAT_MAX_TOKENS_CAP`（32768）；`CHAT_REASONING_EFFORT` 設定時送 `reasoning_effort`。
+- 推理用光額度：HTTP 錯誤（`isOutputBudgetError`）或串流中在任何 content／tool_calls 之前出現同類錯誤或 `finish_reason: length`，由 `budgetRetryStream` 放大 4 倍重送一次並接續新串流；仍失敗回 `output_budget_exhausted` 中文錯誤。已輸出內容後不重試。
+- Edge 串流無 60 秒函式限制，但上限越大回答可能越久。
+
 ## 3.9 伺服器端保存回答
 
 - 前端每則訊息有 `mid`；`/api/chat` 帶 `persist {conversation_id, title, project_id, user{mid,content,at}, assistant_mid}`。

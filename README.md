@@ -116,6 +116,9 @@ test/                                  node:test；資料庫測試以 PGlite 實
 | `TAVILY_API_KEY` | | 網頁搜尋（Tavily）；面板未設定 Key 時的退路 |
 | `SEARCH_MAX_RESULTS` / `SEARCH_SNIPPET_CHARS` / `SEARCH_CONTEXT_CHARS` | | 網頁搜尋注入上限預設值（3／400／1500），面板可覆蓋 |
 | `KEYWORD_SEARCH` | | 關鍵字引擎預設值 `auto`／`bm25`／`bigram`，預設 `auto`；面板設定優先，見[中文斷詞與 BM25 檢索](#中文斷詞與-bm25-檢索) |
+| `CHAT_MAX_TOKENS` | | 每次回答的輸出上限，預設 `8192`，見[輸出上限與推理模型](#輸出上限與推理模型) |
+| `CHAT_MAX_TOKENS_CAP` | | 輸出上限的硬上限，預設 `32768` |
+| `CHAT_REASONING_EFFORT` | | 推理強度 `low`／`medium`／`high`，預設不送 |
 | `PROVIDER_N_NAME` | 該組必填 | 環境變數供應商名稱，`N` = 1–20，見[用環境變數設定供應商](#用環境變數設定供應商) |
 | `PROVIDER_N_BASE_URL` | 該組必填 | OpenAI 相容基底網址（HTTPS） |
 | `PROVIDER_N_API_KEY` | | 該組的 API Key，可留空 |
@@ -272,6 +275,44 @@ PROVIDER_3_EMBED_MODELS=embed-v5.0-pro,embed-multilingual-v3.0
 ### 填進 Netlify
 
 Netlify 專案 → **Project configuration** → **Environment variables** → **Add a variable**，逐一加入上面的變數（Key 建議勾選 secret），存好後**重新部署**才會生效。
+
+## 輸出上限與推理模型
+
+推理型模型（例如 `openai/gpt-oss-120b`）會先「思考」再回答，思考也算輸出 token。上限太小時，供應商會回報類似「The model used its entire output budget on reasoning and returned no answer」。
+
+伺服器的處理：
+
+- 預設每次給 8192 tokens。
+- 供應商回報額度用在推理（HTTP 錯誤或串流中途錯誤），或還沒輸出任何內容就因長度結束時，自動把上限放大 4 倍（不超過 `CHAT_MAX_TOKENS_CAP`）重新請求一次。已經開始輸出回答就不重試。
+- 重試仍失敗時，顯示中文說明與可調整的變數。
+
+### `CHAT_MAX_TOKENS`
+
+- 格式：選填，正整數，最小 256。
+- 預設：`8192`。不可超過 `CHAT_MAX_TOKENS_CAP`。
+
+```
+CHAT_MAX_TOKENS=16384
+```
+
+### `CHAT_MAX_TOKENS_CAP`
+
+- 格式：選填，正整數，最大 131072。
+- 預設：`32768`。自動重試放大上限時也不會超過這個值。請不要超過模型本身的最大輸出長度（Groq 的 gpt-oss 為 65536）。
+
+```
+CHAT_MAX_TOKENS_CAP=65536
+```
+
+### `CHAT_REASONING_EFFORT`
+
+- 格式：選填，`low`、`medium` 或 `high`；其他值視為未設定。
+- 預設：不送此參數，由供應商決定。
+- 設定後所有聊天請求都會帶 `reasoning_effort`。只對支援的模型設定（例如 Groq 的 gpt-oss）；不支援的模型可能回 400。`low` 思考較少、回答較快，也較不容易用光額度。
+
+```
+CHAT_REASONING_EFFORT=low
+```
 
 ## 設定物件儲存
 
